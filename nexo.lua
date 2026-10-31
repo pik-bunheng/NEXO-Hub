@@ -7022,7 +7022,7 @@ do
  local function installLeviathan()
  local rs=game:GetService('ReplicatedStorage');local players=game:GetService('Players')
  local panel=panels['Sea Event'];local token;local serial=0;local boat;local seat;local driving
- local sailingCollisions={};local sailingVelocity={};local flying;local phase='idle';local chosen;local noDamage={};local tracked={};local hadBoss=false
+ local sailingCollisions={};local sailingVelocity={};local flying;local phase='idle';local chosen;local noDamage={};local tracked={};local hadBoss=false;local damageDone={}
  local arrivalCharacter;local arrivalPoint
  local bodyParts={};local arrived=false;local savedWeapon;local savedTool;local pending=false;local boatBuyAt=0
  local TIKI=Vector3.new(-16929,8,435)
@@ -7099,7 +7099,7 @@ do
  local function stop()
   if boat and boat.Parent and seat and seat.Parent then rememberedPosition=seat.Position;rememberedOwner=config().owner;recoverBoat=true end
   local keepHeart=phase=='heart-done' or phase=='heart-return' or phase=='heart-arrived'
-  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};hadBoss=false
+  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};hadBoss=false;damageDone={}
  end
  local function claim()
   if token and farm.SeaActive(token) then return true end
@@ -7327,13 +7327,27 @@ do
   if (r.Position-point).Magnitude>70 then if not move(point+Vector3.new(0,18,10),id) then return end end
   farm.SeaHover(target.part,token,18,false)
   local startHP=health(target.object);local deadline=os.clock()+5
-  status.Text='Attacking '..target.object.Name
+  local lastHP=startHP;local preCombat=damageDone[target.object] or 0
   repeat
    if not active(id) or not config().attack or not target.part.Parent then return end
    local hp=health(target.object);if not hp or hp<=0 then return end
+   -- track HP drop ក្នុង loop ភ្លាម
+   if hp<lastHP then
+    damageDone[target.object]=(damageDone[target.object] or 0)+(lastHP-hp)
+    lastHP=hp
+   end
+   status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/25000 HP]'
+   -- ដល់ 25000 → ចេញភ្លាម មិនរង់ deadline
+   if (damageDone[target.object] or 0)>=25000 then
+    status.Text='25000 HP dealt on '..target.object.Name..'; rotating to next segment'
+    return
+   end
    farm.SeaAttackPart(target.model,target.part,token);task.wait(.08)
   until os.clock()>deadline
-  if health(target.object)==startHP then noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment' end
+  -- ពិនិត្យ no-damage ប្រសិនបើ loop ផុត deadline ដោយ damage = 0
+  if (damageDone[target.object] or 0)==preCombat then
+   noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment'
+  end
  end
  local heartTarget;local heartScanAt=0;local heartShotAt=0;local heartShots=0;local shotObjects={}
  local function findHeart()
@@ -7487,7 +7501,24 @@ do
   if phase=='heart-arrived' then return end
   if c.attack then
    local list=segments();local target
-   for _,v in ipairs(list) do if (noDamage[v.object] or 0)<os.clock() then target=v;break end end
+   -- ជ្រើស segment ដែល noDamage ផុត + damageDone < 25000
+   for _,v in ipairs(list) do
+    if (noDamage[v.object] or 0)<os.clock() and (damageDone[v.object] or 0)<25000 then
+     target=v;break
+    end
+   end
+   -- ប្រសិនបើ segments ទាំងអស់ deal ≥ 25000 HP ហើយ → reset cycle ទាំងអស់
+   if not target then
+    local allRotated=true
+    for _,v in ipairs(list) do
+     if (noDamage[v.object] or 0)<os.clock() and (damageDone[v.object] or 0)<25000 then allRotated=false;break end
+    end
+    if allRotated and #list>0 then
+     for _,v in ipairs(list) do damageDone[v.object]=0 end
+     status.Text='Rotation cycle complete; restarting 25000 HP cycle'
+     return
+    end
+   end
    if target then combat(target,id);return end
    if #list>0 then stopDrive();status.Text='Waiting to retry damageable Leviathan segments';return end
    if hadBoss and #list==0 then
