@@ -7284,37 +7284,61 @@ do
   end)
  end
  local function health(object)
+  if not object then return nil end
   local h=object:FindFirstChildOfClass('Humanoid');if h then return h.Health end
   local hp=object:FindFirstChild('Health') or object:FindFirstChild('HP')
   if hp and hp:IsA('ValueBase') then return tonumber(hp.Value) end
-  return tonumber(object:GetAttribute('Health')) or tonumber(object:GetAttribute('HP'))
+  local attr=tonumber(object:GetAttribute('Health')) or tonumber(object:GetAttribute('HP'))
+  if attr then return attr end
+  if object:IsA('BasePart') and object.Parent and object.Parent:IsA('Model') then
+   local ph=object.Parent:FindFirstChildOfClass('Humanoid')
+   if ph then return ph.Health end
+  end
+  return nil
  end
  local function segments()
   local result={};local seen={}
+  local aliveBodyCount=0
   for _,folder in pairs({workspace:FindFirstChild('SeaBeasts'),workspace:FindFirstChild('Enemies'),workspace}) do
    for _,boss in ipairs(folder:GetChildren()) do if boss:IsA('Model') and boss.Name:lower():find('leviathan',1,true) then
     local candidates={boss};for _,v in ipairs(boss:GetDescendants()) do if v:IsA('Model') or v:IsA('BasePart') then table.insert(candidates,v) end end
     for _,v in ipairs(candidates) do
-     local hp=health(v);local p=v:IsA('BasePart') and v or v:FindFirstChild('HumanoidRootPart') or v.PrimaryPart
+     local hp=health(v);local p=v:IsA('BasePart') and v or v:FindFirstChild('HumanoidRootPart') or v.PrimaryPart or v:FindFirstChild('Head') or v:FindFirstChildWhichIsA('BasePart',true)
      if hp and p and not seen[v] then
       seen[v]=true;tracked[v]=hp;hadBoss=true
-      local n=v.Name:lower();local main=n:find('head',1,true) or n:find('tail',1,true) or n:find('main',1,true)
-      local explicitBody=n:find('segment',1,true) or n:find('body',1,true)
-      local isMain=main or (v==boss and not explicitBody)
+      local n=v.Name:lower()
+      local isHead=n:find('head',1,true)~=nil or n:find('main',1,true)~=nil
+      local explicitBody=n:find('segment',1,true)~=nil or n:find('body',1,true)~=nil or n:find('tail',1,true)~=nil
+      local isMain=isHead or (v==boss and not explicitBody)
       if not isMain then bodyParts[v]=hp end
       local blocked=v:GetAttribute('Invulnerable')==true or v:GetAttribute('CanDamage')==false or v:GetAttribute('Damageable')==false
-      if hp>0 and not blocked then table.insert(result,{object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain}) end
+      if hp>0 and not blocked then
+       if not isMain then aliveBodyCount=aliveBodyCount+1 end
+       table.insert(result,{object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain})
+      end
      end
     end
    end end
   end
   local count,dead=0,0
   for object,lastHP in pairs(bodyParts) do
-   count=count+1;local hp=object.Parent and health(object) or lastHP
-   if hp and hp<=0 then dead=dead+1 end
+   count=count+1
+   local isDead=false
+   if not object or not object.Parent or not object:IsDescendantOf(workspace) then
+    isDead=true
+   else
+    local hp=health(object)
+    if not hp or hp<=0 then isDead=true end
+   end
+   if isDead then dead=dead+1 end
   end
-  -- Do not infer that the main section is unlocked merely because other sections are not streamed in.
-  local mainReady=count>=3 and dead==count
+  -- ក្បាល Leviathan អាចវ៉ៃបាននៅពេល:
+  -- 1) body parts ដែលបាន track ងាប់អស់ (dead >= count)
+  -- 2) ឬគ្មាន body parts នៅរស់ក្នុង workspace ទៀតទេ (aliveBodyCount == 0)
+  local mainReady=(count>0 and dead>=count) or (aliveBodyCount==0 and (count>0 or hadBoss))
+  if mainReady then
+   for _,v in ipairs(result) do if v.main then noDamage[v.object]=nil end end
+  end
   local filtered={};for _,v in ipairs(result) do if not v.main or mainReady then table.insert(filtered,v) end end
   return filtered
  end
@@ -7336,9 +7360,13 @@ do
     damageDone[target.object]=(damageDone[target.object] or 0)+(lastHP-hp)
     lastHP=hp
    end
-   status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/25000 HP]'
-   -- ដល់ 25000 → ចេញភ្លាម មិនរង់ deadline
-   if (damageDone[target.object] or 0)>=25000 then
+   if target.main then
+    status.Text='Attacking Leviathan Head ['..math.floor(hp)..' HP remaining]'
+   else
+    status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/25000 HP]'
+   end
+   -- ដល់ 25000 → ចេញភ្លាម មិនរង់ deadline (បើជាក្បាល/main វ៉ៃបន្តរហូតដល់ងាប់)
+   if not target.main and (damageDone[target.object] or 0)>=25000 then
     status.Text='25000 HP dealt on '..target.object.Name..'; rotating to next segment'
     return
    end
@@ -7501,9 +7529,9 @@ do
   if phase=='heart-arrived' then return end
   if c.attack then
    local list=segments();local target
-   -- ជ្រើស segment ដែល noDamage ផុត + damageDone < 25000
+   -- ជ្រើស segment ដែល noDamage ផុត + (damageDone < 25000 ឬជាក្បាល/main)
    for _,v in ipairs(list) do
-    if (noDamage[v.object] or 0)<os.clock() and (damageDone[v.object] or 0)<25000 then
+    if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<25000) then
      target=v;break
     end
    end
@@ -7511,7 +7539,7 @@ do
    if not target then
     local allRotated=true
     for _,v in ipairs(list) do
-     if (noDamage[v.object] or 0)<os.clock() and (damageDone[v.object] or 0)<25000 then allRotated=false;break end
+     if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<25000) then allRotated=false;break end
     end
     if allRotated and #list>0 then
      for _,v in ipairs(list) do damageDone[v.object]=0 end
@@ -7524,7 +7552,7 @@ do
    if hadBoss and #list==0 then
     local complete=true;for object,lastHP in pairs(tracked) do
      local hp=object.Parent and health(object) or nil
-     if hp~=nil then tracked[object]=hp elseif lastHP>0 then complete=false end
+     if hp~=nil then tracked[object]=hp end
      if hp and hp>0 then complete=false end
     end
     if complete then c.attack=false;c.hunt=false;c.ride=true;phase='return';status.Text='Leviathan defeated; returning to boat';hadBoss=false;task.defer(preferences.Flush)
