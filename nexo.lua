@@ -7297,8 +7297,9 @@ do
   return nil
  end
  local function segments()
-  local result={};local seen={}
-  local aliveBodyCount=0
+  local seen={}
+  local bodyList={}
+  local headList={}
   for _,folder in pairs({workspace:FindFirstChild('SeaBeasts'),workspace:FindFirstChild('Enemies'),workspace}) do
    for _,boss in ipairs(folder:GetChildren()) do if boss:IsA('Model') and boss.Name:lower():find('leviathan',1,true) then
     local candidates={boss};for _,v in ipairs(boss:GetDescendants()) do if v:IsA('Model') or v:IsA('BasePart') then table.insert(candidates,v) end end
@@ -7313,13 +7314,23 @@ do
       if not isMain then bodyParts[v]=hp end
       local blocked=v:GetAttribute('Invulnerable')==true or v:GetAttribute('CanDamage')==false or v:GetAttribute('Damageable')==false
       if hp>0 and not blocked then
-       if not isMain then aliveBodyCount=aliveBodyCount+1 end
-       table.insert(result,{object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain})
+       local entry={object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain}
+       if isMain then
+        table.insert(headList,entry)
+       else
+        table.insert(bodyList,entry)
+       end
       end
      end
     end
    end end
   end
+  -- 1. If Segments are alive in Workspace -> attack Segments only (do not target head)
+  if #bodyList>0 then
+   return bodyList
+  end
+
+  -- 2. Verify status of all tracked Segments
   local count,dead=0,0
   for object,lastHP in pairs(bodyParts) do
    count=count+1
@@ -7332,15 +7343,22 @@ do
    end
    if isDead then dead=dead+1 end
   end
-  -- ក្បាល Leviathan អាចវ៉ៃបាននៅពេល:
-  -- 1) body parts ដែលបាន track ងាប់អស់ (dead >= count)
-  -- 2) ឬគ្មាន body parts នៅរស់ក្នុង workspace ទៀតទេ (aliveBodyCount == 0)
-  local mainReady=(count>0 and dead>=count) or (aliveBodyCount==0 and (count>0 or hadBoss))
-  if mainReady then
-   for _,v in ipairs(result) do if v.main then noDamage[v.object]=nil end end
+
+  -- 3. If just spawned and Segments not streamed in yet (count == 0) -> wait for Segments to load
+  if count==0 and #headList>0 then
+   status.Text='Waiting for Leviathan segments to load'
+   return {}
   end
-  local filtered={};for _,v in ipairs(result) do if not v.main or mainReady then table.insert(filtered,v) end end
-  return filtered
+
+  -- 4. When all Segments are confirmed dead or no Segments remain (#bodyList == 0)
+  --    -> target Leviathan Head until dead
+  local segmentsConfirmedDead=(count>0 and dead>=count) or (count>0 and #bodyList==0) or (hadBoss and #bodyList==0)
+  if segmentsConfirmedDead and #headList>0 then
+   for _,v in ipairs(headList) do noDamage[v.object]=nil end
+   return headList
+  end
+
+  return {}
  end
  local function combat(target,id)
   stopDrive();phase='combat';local h,r=body();if not h then return end
@@ -7355,7 +7373,7 @@ do
   repeat
    if not active(id) or not config().attack or not target.part.Parent then return end
    local hp=health(target.object);if not hp or hp<=0 then return end
-   -- track HP drop ក្នុង loop ភ្លាម
+   -- Track HP drop in loop
    if hp<lastHP then
     damageDone[target.object]=(damageDone[target.object] or 0)+(lastHP-hp)
     lastHP=hp
@@ -7365,14 +7383,14 @@ do
    else
     status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/25000 HP]'
    end
-   -- ដល់ 25000 → ចេញភ្លាម មិនរង់ deadline (បើជាក្បាល/main វ៉ៃបន្តរហូតដល់ងាប់)
+   -- Exit at 25000 HP for segment rotation; if head/main, keep attacking until dead
    if not target.main and (damageDone[target.object] or 0)>=25000 then
     status.Text='25000 HP dealt on '..target.object.Name..'; rotating to next segment'
     return
    end
    farm.SeaAttackPart(target.model,target.part,token);task.wait(.08)
   until os.clock()>deadline
-  -- ពិនិត្យ no-damage ប្រសិនបើ loop ផុត deadline ដោយ damage = 0
+  -- Check no-damage if combat loop times out with 0 damage
   if (damageDone[target.object] or 0)==preCombat then
    noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment'
   end
@@ -7529,13 +7547,13 @@ do
   if phase=='heart-arrived' then return end
   if c.attack then
    local list=segments();local target
-   -- ជ្រើស segment ដែល noDamage ផុត + (damageDone < 25000 ឬជាក្បាល/main)
+   -- Select segment with expired noDamage and (damageDone < 25000 or is main/head)
    for _,v in ipairs(list) do
     if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<25000) then
      target=v;break
     end
    end
-   -- ប្រសិនបើ segments ទាំងអស់ deal ≥ 25000 HP ហើយ → reset cycle ទាំងអស់
+   -- If all segments dealt >= 25000 HP -> reset rotation cycle
    if not target then
     local allRotated=true
     for _,v in ipairs(list) do
