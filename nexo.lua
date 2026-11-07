@@ -222,8 +222,9 @@ local function createFarm(onStatus)
   local kind=farm.SkillCategory(tool)
   return kind and farm.skillUse[kind][key]==true or false
  end
- function farm.SkillQueue(tools)
-  table.sort(tools,function(a,b) return a.Name<b.Name end)
+ function farm.SkillQueue(tools,order)
+  local priority={};for i,kind in ipairs(order or {})do priority[kind]=i end
+  table.sort(tools,function(a,b)local pa,pb=priority[farm.SkillCategory(a)]or 99,priority[farm.SkillCategory(b)]or 99;if pa~=pb then return pa<pb end;return a.Name<b.Name end)
   local queue={}
   for _,tool in ipairs(tools) do
    for _,key in ipairs({'Z','X','C','V','F'}) do
@@ -295,7 +296,7 @@ local function createFarm(onStatus)
   if attachment then attachment:Destroy();attachment=nil end
   stopNoclip()
  end
- local function anyStackEvent() return farm.stackEvents.elite or farm.stackEvents.factory or farm.stackEvents.raid or farm.stackEvents.ripindra or farm.stackEvents.darkbeard or farm.stackEvents.doughking or farm.stackEvents.reaper end
+ local function anyStackEvent() if farm.stackSuspended then return false end;return farm.stackEvents.elite or farm.stackEvents.factory or farm.stackEvents.raid or farm.stackEvents.ripindra or farm.stackEvents.darkbeard or farm.stackEvents.doughking or farm.stackEvents.reaper end
  local function running(token) return alive and (farm.enabled or farm.stackFruit or farm.seaActive or anyStackEvent()) and farm.generation==token end
  local function pause(token,seconds)
   local untilTime=os.clock()+seconds
@@ -350,6 +351,9 @@ local function createFarm(onStatus)
    local dock=Vector3.new(11520.8,-2154.99,9829.51)
    if destination.Y < -1000 and (destination-dock).Magnitude<6000 and fromPosition.Y > -1000 then
     return {name='Submerged Island',entry=Vector3.new(-16269.408,26,1376.662),exit=dock,submarine=true}
+   end
+   if fromPosition.Y < -1000 and (fromPosition-dock).Magnitude<6000 and destination.Y > -1000 then
+    return {name='Submerged Island exit',entry=Vector3.new(11427.919,-2153.364,9726.24),exit=Vector3.new(-16269.408,26,1376.662),submarine=true,returning=true}
    end
   end
   local function add(name,source,target)
@@ -436,7 +440,7 @@ local function createFarm(onStatus)
    if route then
     if route.submarine then
      if entranceBusy or os.clock()<entranceAt then pause(token,.5);return false end
-     status('Travelling to Tiki submarine')
+     status(route.returning and 'Travelling to Submerged Island submarine' or 'Travelling to Tiki submarine')
      if not moveTo(route.entry,token,true) then return false end
      if not running(token) then return false end
      entranceBusy=true;entranceAt=os.clock()+10
@@ -445,23 +449,38 @@ local function createFarm(onStatus)
       local controller
       local ok=pcall(function()
        controller=require(RS.Controllers.MapServices.SubmergedIslandController)
-       controller:LockState();controller:LoadMap();task.wait(.5)
-       if running(token) then
-        accepted=RS.Modules.Net:FindFirstChild('RF/SubmarineWorkerSpeak'):InvokeServer('TravelToSubmergedIsland')==true
+       controller:LockState()
+       if route.returning then
+        if running(token) then controller:RequestLeaveIslandAbnormally();accepted=true end
+       else
+        controller:LoadMap()
+        if running(token) then
+         accepted=RS.Modules.Net:FindFirstChild('RF/SubmarineWorkerSpeak'):InvokeServer('TravelToSubmergedIsland')==true
+        end
        end
       end)
       if controller then pcall(function() controller:UnlockState() end) end
       accepted=ok and accepted;completed=true;entranceBusy=false
+      if not route.returning then entranceAt=os.clock()+(accepted and .25 or 1)end
      end)
      local deadline=os.clock()+12
      while running(token) and not completed and os.clock()<deadline do task.wait(.1) end
      if not running(token) then return false end
      if not completed or not accepted then status('Submarine trip not accepted; waiting to retry');return false end
-     if not pause(token,.5) then return false end
-     local _,_,root=body()
-     if not root or (root.Position-route.exit).Magnitude>1500 or root.Position.Y > -1000 then
-      status('Waiting for Submerged Island arrival');return false
+     if route.returning and not pause(token,.5)then return false end
+     local arrivalDeadline=os.clock()+8
+     local function atSubmarineDestination()
+      local _,_,root=body()
+      if not root then return false end
+      if route.returning then return root.Position.Y > -1000 end
+      return root.Position.Y < -1000 and (root.Position-route.exit).Magnitude<=1500 and require(RS.Controllers.MapServices.SubmergedIslandController):IsMapInWorkspace()
      end
+     while running(token) and not atSubmarineDestination()and os.clock()<arrivalDeadline do task.wait(.1)end
+     if not running(token)then return false end
+     if not atSubmarineDestination()then
+      status(route.returning and 'Waiting for submarine return to the surface' or 'Waiting for Submerged Island arrival');return false
+     end
+     if route.returning then pcall(function()require(RS.Controllers.MapServices.Transitions.MapTransitionEffect).StopEarly()end)end
      return moveTo(position,token,false)
     end
     if route.staging then
@@ -546,33 +565,27 @@ local function createFarm(onStatus)
       end
       local function aimDown()
        if not camera.Parent or not hr.Parent then return end
-       camera.CameraType=Enum.CameraType.Scriptable
-       camera.CFrame=CFrame.lookAt(hr.Position+Vector3.new(0,12,8),aimPoint)
-       camera.Focus=CFrame.new(aimPoint)
-       if savedMouse then mousePosition.Value=aimPoint end
-       local projected=camera:WorldToViewportPoint(aimPoint)
-       local inset=game:GetService('GuiService'):GetGuiInset()
-       sendInput('SendMouseMoveEvent',projected.X+inset.X,projected.Y+inset.Y,game)
+       farm.SetSkillAim(aimPoint,token)
       end
       local aimConnection=RunService.RenderStepped:Connect(function() pcall(aimDown) end)
       local pressed,inputError=pcall(function()
        if not useCannon and not farm.SkillAllowed(tool,skillKey.Name) then return end
        aimDown()
        if useCannon then
-        local p=camera:WorldToViewportPoint(aimPoint);local inset=game:GetService('GuiService'):GetGuiInset()
+        local p=Vector3.new(camera.ViewportSize.X*.5,camera.ViewportSize.Y*.5,0);local inset=Vector2.zero
         sendInput('SendMouseButtonEvent',p.X+inset.X,p.Y+inset.Y,0,true,game,0)
        else sendInput('SendKeyEvent',true,skillKey,false,game) end
        pause(token,useCannon and .12 or .35)
       end)
       pcall(function()
        if useCannon then
-        local p=camera:WorldToViewportPoint(aimPoint);local inset=game:GetService('GuiService'):GetGuiInset()
+        local p=Vector3.new(camera.ViewportSize.X*.5,camera.ViewportSize.Y*.5,0);local inset=Vector2.zero
         sendInput('SendMouseButtonEvent',p.X+inset.X,p.Y+inset.Y,0,false,game,0)
        else sendInput('SendKeyEvent',false,skillKey,false,game) end
       end)
       if running(token) then pause(token,useCannon and .9 or .2) end
       aimConnection:Disconnect()
-      pcall(function() camera.CameraType=savedType;camera.CFrame=savedCamera;camera.Focus=savedFocus;if savedMouse then mousePosition.Value=savedMouse end end)
+      farm.ClearSkillAim(token)
       if not pressed then status('Cloud input failed: '..tostring(inputError));return false end
       if not running(token) then return false end
       if player.Character~=char or not hr.Parent then return false end
@@ -632,8 +645,17 @@ local function createFarm(onStatus)
   if activeTween==movement then releaseMovement() end
   if stalled and running(token) and (not keepMoving or keepMoving()) and (retryCount or 0)<2 then
    farm.movementRecoveries=(farm.movementRecoveries or 0)+1
-   status('Repositioning around obstacle')
-   if pause(token,.2) then return moveTo(position,token,skipEntrance,(retryCount or 0)+1,keepMoving) end
+   status('Moving above the obstacle')
+   local lift=math.max(hr.Position.Y,position.Y)+45
+   local ray=RaycastParams.new();ray.FilterType=Enum.RaycastFilterType.Include;ray.FilterDescendantsInstances={workspace.Map,workspace.Terrain};ray.RespectCanCollide=true
+   local delta=position-hr.Position
+   local obstacle=delta.Magnitude>0 and workspace:Raycast(hr.Position,delta.Unit*math.min(delta.Magnitude,100),ray)
+   if obstacle and obstacle.Instance:IsA('BasePart')then lift=math.max(lift,math.min(hr.Position.Y+180,obstacle.Instance.Position.Y+obstacle.Instance.Size.Y/2+12))end
+   local rise=Vector3.new(hr.Position.X,lift,hr.Position.Z)
+   local across=Vector3.new(position.X,lift,position.Z)
+   if moveTo(rise,token,true,2,keepMoving)and moveTo(across,token,true,2,keepMoving)then
+    return moveTo(position,token,skipEntrance,2,keepMoving)
+   end
   end
   return arrived
  end
@@ -2167,18 +2189,12 @@ local function createFarm(onStatus)
    if not ok then error(err,0) end
   end
   local ok=pcall(function()
-   camera.CameraType=Enum.CameraType.Scriptable
-   camera.CFrame=CFrame.lookAt(hr.Position+Vector3.new(0,3,0),part.Position);camera.Focus=CFrame.new(part.Position)
-   if savedMouse then mouse.Value=part.Position end
-   local screen=camera:WorldToViewportPoint(part.Position);local inset=game:GetService('GuiService'):GetGuiInset()
-   x,y=screen.X+inset.X,screen.Y+inset.Y
+   farm.SetSkillAim(part.Position,token,part)
+   x,y=camera.ViewportSize.X*.5,camera.ViewportSize.Y*.5
    pressed=true;click(true);status('Breaking pot: '..tool.Name..' M1');pause(token,.12)
   end)
   if pressed then pcall(click,false) end
-  pcall(function()
-   camera.CameraType=savedType;camera.CFrame=savedCF;camera.Focus=savedFocus
-   if savedMouse and mouse.Parent then mouse.Value=savedMouse end
-  end)
+  farm.ClearSkillAim(token)
   potGunShotAt=os.clock()+1.5
   return ok
  end
@@ -2376,6 +2392,7 @@ local function createFarm(onStatus)
   farm.stackFruit=value;farm.stackMessage=value and 'Watching for fruits' or 'Off';restart()
  end
  function farm.PriorityBoss()
+  if farm.stackSuspended then return end
   if workspace:GetAttribute('MAP')~='Sea3' then return end
   if farm.stackEvents.doughking then local boss=spawnedBoss({['dough king']=true});if boss then return boss end end
   if farm.stackEvents.reaper then return spawnedBoss({['soul reaper']=true}) end
@@ -2384,7 +2401,7 @@ local function createFarm(onStatus)
  function farm.HasLooseFruit() return scanFruit and scanFruit()~=nil end
  function farm.SetStackEvent(key,value)
   if farm.stackEvents[key]==nil then return end
-  farm.stackEvents[key]=value==true;restart()
+  farm.stackEvents[key]=value==true;if not farm.stackSuspended then restart() end
  end
  function farm.SetWeapon(value)
   if value=='Melee' or value=='Sword' or value=='Demon Fruit' or value=='Gun' then farm.weapon=value;status(farm.message) end
@@ -2562,6 +2579,50 @@ local function createFarm(onStatus)
   if h and h.SeatPart then h.Sit=false;h.Jump=true;task.wait(.3) end
   seaHoverRoot=nil;return moveTo(position,token,keepMoving~=nil,nil,keepMoving)
  end
+ -- Volcano movement follows a kinematic CFrame tween with a zero-velocity float.
+ -- It never changes lava parts or character health.
+ function farm.VolcanoMove(position,token,keepMoving)
+  if not farm.SeaActive(token)then return false end
+  local char,h,hr=body();if not hr then return false end
+  stopHover();stopStabilize();releaseMovement()
+  if h.Sit then h.Sit=false;h.Jump=true end
+  startNoclip(char);travelHumanoid=h;travelAutoRotate=h.AutoRotate;h.AutoRotate=false
+  flight=Instance.new('BodyVelocity');flight.Name='NexoVolcanoFloat';flight.Velocity=Vector3.zero;flight.MaxForce=Vector3.new(1e7,1e7,1e7);flight.Parent=hr
+  local zero=RunService.PreSimulation:Connect(function()
+   if farm.SeaActive(token)and hr.Parent and player.Character==char then hr.AssemblyLinearVelocity=Vector3.zero;hr.AssemblyAngularVelocity=Vector3.zero end
+  end)
+  local duration=math.max(.08,(hr.Position-position).Magnitude/math.max(40,farm.tweenSpeed))
+  activeTween=TweenService:Create(hr,TweenInfo.new(duration,Enum.EasingStyle.Linear),{CFrame=CFrame.new(position)*hr.CFrame.Rotation})
+  local movement=activeTween;movement:Play();local deadline=os.clock()+duration+1
+  while farm.SeaActive(token)and player.Character==char and hr.Parent and h.Health>0 and(not keepMoving or keepMoving())and os.clock()<deadline and movement.PlaybackState==Enum.PlaybackState.Playing do task.wait(.03)end
+  local arrived=farm.SeaActive(token)and player.Character==char and hr.Parent and h.Health>0 and(not keepMoving or keepMoving())and(hr.Position-position).Magnitude<8
+  zero:Disconnect()
+  if activeTween==movement then releaseMovement()end
+  return arrived
+ end
+ function farm.VolcanoHold(position,token,aim)
+  if not farm.SeaActive(token)then return false end
+  local char,h,hr=body();if not hr then return false end
+  local previous=farm.volcanoHold
+  if previous and previous.token==token and previous.root==hr then previous.position=position;previous.aim=aim;return true end
+  stopHover();stopStabilize();releaseMovement();startNoclip(char)
+  local originalRotate=h.AutoRotate;h.AutoRotate=false
+  local float=Instance.new('BodyVelocity');float.Name='NexoVolcanoFloat';float.Velocity=Vector3.zero;float.MaxForce=Vector3.new(1e7,1e7,1e7);float.Parent=hr
+  local state={position=position,aim=aim,token=token,root=hr};farm.volcanoHold=state
+  local rotation=hr.CFrame.Rotation;local connection;local stopped=false
+  local function cleanup()
+   if stopped then return end;stopped=true
+   if connection then connection:Disconnect()end
+   float:Destroy();pcall(function()h.AutoRotate=originalRotate end);stopNoclip()
+   if farm.volcanoHold==state then farm.volcanoHold=nil end
+  end
+  connection=RunService.PreSimulation:Connect(function()
+   if not farm.SeaActive(token)or player.Character~=char or not hr.Parent or h.Health<=0 then cleanup();return end
+   if state.aim then local delta=(state.aim-state.position)*Vector3.new(1,0,1);if delta.Magnitude>.01 then rotation=CFrame.lookAt(Vector3.zero,delta.Unit)end end
+   hr.CFrame=CFrame.new(state.position)*rotation;hr.AssemblyLinearVelocity=Vector3.zero;hr.AssemblyAngularVelocity=Vector3.zero
+  end)
+  stopHover=cleanup;return true
+ end
  function farm.SeaHold(position,token,aim)
   if not farm.SeaActive(token) then return end
   if type(seaHoverRoot)=='table' and seaHoverRoot.nexoFixed and not farm.hoverStuck then seaHoverRoot.Position=position;seaHoverRoot.nexoAim=aim;return end
@@ -2626,7 +2687,7 @@ local function createFarm(onStatus)
   for _,container in pairs({char,player:FindFirstChild('Backpack')}) do
    for _,tool in ipairs(container:GetChildren()) do if tool:IsA('Tool') and farm.SkillCategory(tool) and (not state.categories or state.categories[farm.SkillCategory(tool)]) then table.insert(tools,tool) end end
   end
-  local queue=farm.SkillQueue(tools)
+  local queue=farm.SkillQueue(tools,state.order)
   if #queue==0 then return false,'Enable skills in Settings > Skill Use' end
   state.used=state.used or {};state.cursor=state.cursor or 0
   local entry
@@ -2644,8 +2705,6 @@ local function createFarm(onStatus)
   local tool,key=entry.tool,entry.key
   local point=targetPosition();if not point or not running(token) then return false,'Target finished' end
   local camera=workspace.CurrentCamera;if not camera then return false,'Camera unavailable' end
-  local savedType,savedCF,savedFocus=camera.CameraType,camera.CFrame,camera.Focus
-  local mouse=tool:FindFirstChild('MousePos');local oldMouse=mouse and mouse:IsA('Vector3Value') and mouse.Value
   local input=game:GetService('VirtualInputManager')
   local function send(method,...)
    local setID=setthreadidentity or setidentity;local getID=getthreadidentity or getidentity
@@ -2655,12 +2714,7 @@ local function createFarm(onStatus)
   end
   local function aim()
    local target=targetPosition();if not target or not running(token) then return false end
-   camera.CameraType=Enum.CameraType.Scriptable
-   camera.CFrame=CFrame.lookAt(hr.Position+Vector3.new(0,8,6),target);camera.Focus=CFrame.new(target)
-   if oldMouse and mouse.Parent then mouse.Value=target end
-   local p=camera:WorldToViewportPoint(target);local inset=game:GetService('GuiService'):GetGuiInset()
-   send('SendMouseMoveEvent',p.X+inset.X,p.Y+inset.Y,game)
-   return true
+   return farm.SetSkillAim(target,token)
   end
   local pressed=false;local canceled=false
   local connection=RunService.RenderStepped:Connect(function()
@@ -2688,7 +2742,7 @@ local function createFarm(onStatus)
    while running(token) and targetPosition() and os.clock()<confirmUntil do pause(token,.05) end
   end
   connection:Disconnect()
-  pcall(function() camera.CameraType=savedType;camera.CFrame=savedCF;camera.Focus=savedFocus;if oldMouse and mouse.Parent then mouse.Value=oldMouse end end)
+  farm.ClearSkillAim(token)
   return ok and pressed,ok and ('Used '..tool.Name..' '..key.Name) or tostring(err)
  end
 
@@ -2742,13 +2796,7 @@ local function createFarm(onStatus)
       end
       local function aimDown()
        if not camera.Parent or not hr.Parent then return end
-       camera.CameraType=Enum.CameraType.Scriptable
-       camera.CFrame=CFrame.lookAt(hr.Position+Vector3.new(0,12,8),aimPoint)
-       camera.Focus=CFrame.new(aimPoint)
-       if savedMouse then mousePosition.Value=aimPoint end
-       local projected=camera:WorldToViewportPoint(aimPoint)
-       local inset=game:GetService('GuiService'):GetGuiInset()
-       sendInput('SendMouseMoveEvent',projected.X+inset.X,projected.Y+inset.Y,game)
+       farm.SetSkillAim(aimPoint,token)
       end
       local aimConnection=RunService.RenderStepped:Connect(function() pcall(aimDown) end)
       local pressed,inputError=pcall(function()
@@ -2759,7 +2807,7 @@ local function createFarm(onStatus)
         local shotDelay=cooldown and cooldown:IsA('NumberValue') and tonumber(cooldown.Value) or 1.5
         shotDelay=math.clamp(shotDelay+.15,.5,5)
         cannonReadyAt=os.clock()+shotDelay
-        local p=camera:WorldToViewportPoint(aimPoint);local inset=game:GetService('GuiService'):GetGuiInset()
+        local p=Vector3.new(camera.ViewportSize.X*.5,camera.ViewportSize.Y*.5,0);local inset=Vector2.zero
         sendInput('SendMouseButtonEvent',p.X+inset.X,p.Y+inset.Y,0,true,game,0)
         pause(token,.12)
         sendInput('SendMouseButtonEvent',p.X+inset.X,p.Y+inset.Y,0,false,game,0)
@@ -2771,13 +2819,13 @@ local function createFarm(onStatus)
       end)
       pcall(function()
        if useCannon then
-        local p=camera:WorldToViewportPoint(aimPoint);local inset=game:GetService('GuiService'):GetGuiInset()
+        local p=Vector3.new(camera.ViewportSize.X*.5,camera.ViewportSize.Y*.5,0);local inset=Vector2.zero
         sendInput('SendMouseButtonEvent',p.X+inset.X,p.Y+inset.Y,0,false,game,0)
        else sendInput('SendKeyEvent',false,skillKey,false,game) end
       end)
       if running(token) then pause(token,.05) end
       aimConnection:Disconnect()
-      pcall(function() camera.CameraType=savedType;camera.CFrame=savedCamera;camera.Focus=savedFocus;if savedMouse then mousePosition.Value=savedMouse end end)
+      farm.ClearSkillAim(token)
       if not pressed then status('Cloud input failed: '..tostring(inputError));return false end
       if not running(token) then return false end
       if player.Character~=char or not hr.Parent then return false end
@@ -3846,7 +3894,7 @@ do
  local teleporting=false;local queued=false;local lastWritten;local manualSave=false
  local available=type(readfile)=='function' and type(writefile)=='function' and type(isfile)=='function'
  local function snapshot(resume)
-  return {soulPuzzleDone=preferences.soulPuzzleDone,autoSoulGuitar=preferences.autoSoulGuitar,autoRengoku=preferences.autoRengoku,autoSpawnDarkbeard=preferences.autoSpawnDarkbeard,autoSpawnDoughKing=preferences.autoSpawnDoughKing,raid=preferences.raid,autoSpawnIndra=preferences.autoSpawnIndra,autoTushita=preferences.autoTushita,levi=preferences.levi,autoSaber=preferences.autoSaber,styleJob=preferences.styleJob,styleWaitUntil=preferences.styleWaitUntil,collectFist=preferences.collectFist,autoTrial=preferences.autoTrial,raceV2=preferences.raceV2,raceV3=preferences.raceV3,v4Training=preferences.v4Training,findFullMoon=preferences.findFullMoon,skillUse=farm.skillUse,movement=table.clone(preferences.movement),safeRetreat=preferences.safeRetreat,auto=table.clone(preferences.auto),other=table.clone(preferences.other),autoSave=preferences.autoSave,autoLoad=preferences.autoLoad,autoLoadTeam=preferences.autoLoadTeam,version=1,userId=player.UserId,resume=resume,save=preferences.save,syn=preferences.syn,
+  return {autoCDK=preferences.autoCDK,autoSpawnReaper=preferences.autoSpawnReaper,soulPuzzleDone=preferences.soulPuzzleDone,autoSoulGuitar=preferences.autoSoulGuitar,autoRengoku=preferences.autoRengoku,autoSpawnDarkbeard=preferences.autoSpawnDarkbeard,autoSpawnDoughKing=preferences.autoSpawnDoughKing,raid=preferences.raid,autoSpawnIndra=preferences.autoSpawnIndra,autoTushita=preferences.autoTushita,levi=preferences.levi,autoSaber=preferences.autoSaber,styleJob=preferences.styleJob,styleWaitUntil=preferences.styleWaitUntil,collectFist=preferences.collectFist,autoTrial=preferences.autoTrial,raceV2=preferences.raceV2,raceV3=preferences.raceV3,v4Training=preferences.v4Training,findFullMoon=preferences.findFullMoon,skillUse=farm.skillUse,movement=table.clone(preferences.movement),safeRetreat=preferences.safeRetreat,auto=table.clone(preferences.auto),other=table.clone(preferences.other),autoSave=preferences.autoSave,autoLoad=preferences.autoLoad,autoLoadTeam=preferences.autoLoadTeam,version=1,userId=player.UserId,resume=resume,save=preferences.save,syn=preferences.syn,
    farm={enabled=farm.enabled,mode=farm.mode,material=farm.material,weapon=farm.weapon,tweenSpeed=farm.tweenSpeed,bringMobs=farm.bringMobs,mobLimit=farm.mobLimit,autoClick=farm.autoClick,stackFruit=farm.stackFruit,stackEvents=table.clone(farm.stackEvents)},
    hopWait=preferences.hopWait or 20,fruitHop=preferences.fruitHop==true,eliteHop=preferences.eliteHop==true,stats=table.clone(stats.selected),sea=sea.Snapshot(),travel=travelAPI.Snapshot()}
  end
@@ -3896,7 +3944,9 @@ do
     preferences.autoSpawnDoughKing=saved.resume==true and saved.autoSpawnDoughKing==true
     preferences.soulPuzzleDone=saved.soulPuzzleDone==true
     preferences.autoSoulGuitar=saved.resume==true and saved.autoSoulGuitar==true
+    preferences.autoCDK=saved.resume==true and saved.autoCDK==true
     preferences.autoRengoku=saved.resume==true and saved.autoRengoku==true
+    preferences.autoSpawnReaper=saved.resume==true and saved.autoSpawnReaper==true
     preferences.autoSpawnDarkbeard=saved.resume==true and saved.autoSpawnDarkbeard==true
     preferences.autoSpawnIndra=saved.resume==true and saved.autoSpawnIndra==true
     preferences.autoTushita=saved.resume==true and saved.autoTushita==true
@@ -3933,7 +3983,7 @@ do
     local travelChosen=(travel.sea==game.PlaceId or travel.sea==currentSeaId) and travelAPI.Select(travel.key)
     if saved.resume==true then
      preferences.autoSaber=saved.autoSaber==true
-     preferences.collectFist=saved.collectFist==true
+     preferences.collectFist=false
      preferences.autoTrial=saved.autoTrial==true
      preferences.raceV2=saved.raceV2==true;preferences.raceV3=saved.raceV3==true
      preferences.v4Training=saved.v4Training==true
@@ -3942,7 +3992,7 @@ do
      preferences.styleWaitUntil=tonumber(saved.styleWaitUntil)
      if type(saved.auto)=='table' then for _,k in ipairs({'v3','v4','aura','rollFruit','storeFruit'}) do preferences.auto[k]=saved.auto[k]==true end end
      if type(saved.other)=='table' then
-      for _,key in ipairs({'berry','berryHop','aura','sword','chest','chestHop','limit','haki','hakiHop'}) do preferences.other[key]=saved.other[key]==true end
+      for _,key in ipairs({'berry','berryHop','aura','sword','chest','chestHop','limit','haki','hakiHop','darkbeardChestHop'}) do preferences.other[key]=saved.other[key]==true end
       preferences.other.count=math.clamp(math.floor(tonumber(saved.other.count) or 20),1,1000)
       preferences.other.job=saved.other.job;preferences.other.collected=tonumber(saved.other.collected) or 0
      end
@@ -4002,7 +4052,11 @@ do
  local panel=panels['Farm Other']
  local buttons={};local deferred=setmetatable({},{__mode='k'})
  local token;local resumeFarm;local currentChest;local chestConfirmed=false;local nextVendor={};local knownOffers={}
- local patrolVisited={};local patrolDone=false;local patrolRestart=0
+ local patrolVisited={};local patrolFailures={};local patrolDone=false;local patrolRestart=0
+ local function resetPatrol()
+  patrolVisited={};patrolFailures={};patrolDone=false
+  for object,untilTime in pairs(deferred)do if untilTime==math.huge then deferred[object]=nil end end
+ end
  local function config() return preferences.other end
  local function refreshButtons()
   for key,b in pairs(buttons) do
@@ -4028,7 +4082,7 @@ do
    otherFarm.stopped=false
    config()[key]=not config()[key]
    if key=='aura' or key=='sword' then nextVendor[key]=0 end
-   if key=='chest' then patrolVisited={};patrolDone=false;otherFarm.chestReady=config().chest end
+   if key=='chest' then resetPatrol();otherFarm.chestReady=config().chest end
    if not config()[key] and key~='limit' and token then farm.SeaEnd(token);token=nil end
    refreshButtons();task.defer(preferences.Flush)
   end)
@@ -4046,9 +4100,18 @@ do
  function otherFarm.Stop()
   otherFarm.stopped=true;otherFarm.paused=false
   resumeFarm=nil;currentChest=nil;otherFarm.busy=false;otherFarm.chestReady=false;otherFarm.berryReady=false
-  for _,k in ipairs({'berry','berryHop','aura','sword','chest','chestHop'}) do config()[k]=false end
+  for _,k in ipairs({'berry','berryHop','aura','sword','chest','chestHop','darkbeardChestHop'}) do config()[k]=false end
   if token then farm.SeaEnd(token);token=nil end
   refreshButtons()
+ end
+ function preferences.SetDarkbeardChestHop(on)
+  if not on then otherFarm.Stop();config().darkbeardChestHop=false;preferences.Flush();return true end
+  if game.PlaceId~=4442272183 and game.PlaceId~=79091703265657 then farm.message='Fist of Darkness chest hunting requires Second Sea';return false end
+  if preferences.StopAll then preferences.StopAll()else otherFarm.Stop()end
+  local c=config();c.darkbeardChestHop=true;c.chest=true;c.chestHop=true;c.limit=true;c.count=25;c.collected=0
+  otherFarm.stopped=false;otherFarm.paused=false;otherFarm.chestReady=true
+  resetPatrol();patrolRestart=0;preferences.save=true
+  countBox.Text='25';refreshButtons();say('Fist hunt: collect 25 chests, then hop');preferences.Flush();return true
  end
  function otherFarm.PausePriority()
   otherFarm.paused=true;otherFarm.busy=false
@@ -4132,7 +4195,7 @@ do
   if patrolDone then
    if config().chestHop then return end
    if os.clock()<patrolRestart then say('Waiting for chest respawns');return end
-   patrolVisited={};patrolDone=false
+   resetPatrol()
   end
   local r=root();if not r then return end
   local entries=travelAPI.Options();local best,gap
@@ -4152,9 +4215,16 @@ do
   if beginMove(best.position+Vector3.new(0,5,0)) and config().chest then
    local deadline=os.clock()+2
    repeat task.wait(.1) until chests() or not safe() or not config().chest or not farm.SeaActive(token) or os.clock()>=deadline
-   if safe() and config().chest and farm.SeaActive(token) then patrolVisited[best.key]=true end
+   if safe() and config().chest and farm.SeaActive(token) then patrolVisited[best.key]=true;patrolFailures[best.key]=nil end
+  elseif safe() and config().chest then
+   patrolFailures[best.key]=(patrolFailures[best.key]or 0)+1
+   if patrolFailures[best.key]>=3 then patrolVisited[best.key]=true;say('Route unavailable; checking another island')end
   end
   finishMove()
+ end
+ function otherFarm.ChestSnapshot()
+  local visited={};for key in pairs(patrolVisited)do visited[#visited+1]=key end
+  return {enabled=config().chest,hop=config().chestHop,limit=config().limit,count=config().count,collected=config().collected or 0,visited=visited,sweepComplete=patrolDone,status=otherFarm.message}
  end
  local function collectChest(chest)
   say('Collecting chest');currentChest=chest;chestConfirmed=false
@@ -4182,7 +4252,7 @@ do
    if chestConfirmed then config().collected=(config().collected or 0)+1;preferences.Flush();say('Pickup confirmed')
    else say('Pickup not confirmed; retry later') end
   end
-  deferred[chest]=os.clock()+15;finishMove()
+  deferred[chest]=chestConfirmed and os.clock()+15 or math.huge;finishMove()
  end
  local function vendor(kind)
   if not config()[kind] or (nextVendor[kind] or 0)>os.clock() then return false end
@@ -4226,20 +4296,20 @@ do
   while alive do
    if preferenceReady then
     local c=config()
-    if c.job~=game.JobId then c.job=game.JobId;c.collected=0;patrolVisited={};patrolDone=false end
+    if c.job~=game.JobId then c.job=game.JobId;c.collected=0;resetPatrol() end
     refreshButtons()
     if not countBox:IsFocused() then countBox.Text=tostring(c.count) end
     if safe() and not farm.HasStackTarget() then
      local ok,err=pcall(function()
       local berry=c.berry and berries();local limited=c.limit and (c.collected or 0)>=c.count
       local chest=c.chest and not limited and chests()
-      -- A retry delay must not look like an empty server to the hop controller.
+      -- Patrol all islands before treating the server as empty; deferred failures cannot block patrol.
       otherFarm.berryReady=c.berry and berries(true)~=nil or false
-      otherFarm.chestReady=c.chest and not limited and (chests(true)~=nil or not patrolDone or not c.chestHop) or false
+      otherFarm.chestReady=c.chest and not limited and (chests()~=nil or not patrolDone or not c.chestHop) or false
       if vendor('aura') or vendor('sword') then return end
       if berry then collectBerry(berry)
       elseif chest then collectChest(chest)
-      elseif c.chest and not limited and not chests(true) then patrolChests()
+      elseif c.chest and not limited then patrolChests()
       else say(limited and 'Chest limit reached' or c.aura and otherFarm.auraMessage or 'Waiting for collectibles') end
      end)
      if not ok then finishMove();say('Retry: '..tostring(err)) end
@@ -4256,13 +4326,13 @@ do
  local teleport=game:GetService('TeleportService')
  local rs=game:GetService('ReplicatedStorage')
  local busy=false;local protected=false;local absentSince=os.clock();local nextHop=0
- local retreatStarted=false;local retreatToken
+ local retreatStarted=false;local retreatToken;local huntProtected=false
  label(settings,'Retreat to Safety with Rare Items',18,406,370,28,13)
  local retreatToggle=control(settings,'ON',410,406,80,28)
  bindControl(retreatToggle,'Activated',function()
   preferences.safeRetreat=not preferences.safeRetreat
   retreatToggle.Text=preferences.safeRetreat and 'ON' or 'OFF'
-  if not preferences.safeRetreat and retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil;retreatStarted=false end
+  if not preferences.safeRetreat and not huntProtected and retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil;retreatStarted=false end
   task.defer(preferences.Flush)
  end)
  local visited={[game.JobId]=true}
@@ -4337,7 +4407,8 @@ do
   end
   return false
  end
- preferences.HasRareItem=hasChalice
+ preferences.RareItemName=hasChalice
+ preferences.HasRareItem=function() return (preferences.safeRetreat or huntProtected)and hasChalice() or false end
  local function elitePresent()
   for _,container in ipairs({rs,workspace:FindFirstChild('Enemies')}) do
    if container then for _,enemy in ipairs(container:GetChildren()) do
@@ -4368,7 +4439,7 @@ do
   -- Never reset or teleport while carrying a rare summon item.
   local destination=fist and Vector3.new(-385,73,297) or Vector3.new(-12548,338,-7481)
   for _=1,5 do
-   if not alive or not preferences.safeRetreat or preferences.autoSpawnIndra or preferences.autoSpawnDoughKing or preferences.autoSpawnDarkbeard or not farm.SeaActive(token) then return end
+   if not alive or (not preferences.safeRetreat and not huntProtected)or preferences.autoSpawnIndra or preferences.autoSpawnDoughKing or preferences.autoSpawnDarkbeard or not farm.SeaActive(token) then return end
    if farm.SeaMove(destination,token) then
     farm.SeaEnd(token);if fist then preferences.fistSheltered=true end;farm.message=item..(fist and ": staying at Cafe" or ": staying at Mansion");return
    end
@@ -4515,20 +4586,29 @@ do
     button.Text=preferences.eliteHop and 'ON' or 'OFF';fruitButton.Text=preferences.fruitHop and 'ON' or 'OFF'
     retreatToggle.Text=preferences.safeRetreat and 'ON' or 'OFF'
     local rare=hasChalice()
-    local intentional=(preferences.autoSpawnDarkbeard and rare=='Fist of Darkness') or ((preferences.autoSpawnIndra or preferences.autoSpawnDoughKing) and rare and rare:lower():find('chalice',1,true)) or (preferences.autoSpawnDoughKing and os.clock()<(preferences.doughExchangeUntil or 0))
-    if protected and not rare and not intentional then
+    local rareKey=rare and rare:lower():gsub('[^%a]','')
+    if (preferences.eliteHop and (rareKey=='godschalice'or rareKey=='godchalice'))or(preferences.other.darkbeardChestHop and rareKey=='fistofdarkness')then
+     -- Summon-item hunts always protect their reward, even if global retreat is OFF.
+     huntProtected=true;protected=true;pending=nil;retrySoon=false;manualMode=nil
+     preferences.autoSpawnIndra=false;preferences.autoSpawnDoughKing=false;preferences.autoSpawnDarkbeard=false;preferences.autoSpawnReaper=false
+     if preferences.CancelAllHop then preferences.CancelAllHop()end
+     if preferences.StopAll then preferences.StopAll()end
+     stopEverything();retreatStarted=true;task.spawn(shelter)
+    end
+    local intentional=not huntProtected and ((preferences.autoSpawnDarkbeard and rare=='Fist of Darkness') or ((preferences.autoSpawnIndra or preferences.autoSpawnDoughKing) and rare and rare:lower():find('chalice',1,true)) or (preferences.autoSpawnDoughKing and os.clock()<(preferences.doughExchangeUntil or 0)))
+    if protected and ((not preferences.safeRetreat and not huntProtected)or (not rare and not intentional))then
      -- Consumed/lost item: release protection, but leave canceled jobs OFF.
      if retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil end
-     protected=false;retreatStarted=false;absentSince=os.clock()
+     protected=false;huntProtected=false;retreatStarted=false;absentSince=os.clock()
     end
     if intentional then
      if retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil end
      retreatStarted=false;protected=false;absentSince=os.clock()
-    elseif not protected and hasChalice() then
+    elseif not protected and preferences.safeRetreat and hasChalice() then
      protected=true;stopEverything()
      if preferences.safeRetreat then retreatStarted=true;task.spawn(shelter)
      else farm.message=tostring(hasChalice())..': stopped here; server hopping blocked' end
-    elseif protected and hasChalice() and preferences.safeRetreat and not retreatStarted then
+    elseif protected and hasChalice() and (preferences.safeRetreat or huntProtected)and not retreatStarted then
      retreatStarted=true;task.spawn(shelter)
     elseif not protected then
      if not canHop() then absentSince=os.clock() end
@@ -5045,15 +5125,17 @@ do
   return string.format('%02d:%02d:%02d',math.floor(seconds/3600),math.floor(seconds/60)%60,seconds%60)
  end
  local function moonHours(phase,hour)
-  -- Noon full-moon phase is the upcoming evening, not the expired night.
-  local night=hour>=18 or hour<5
-  if phase==5 and night then return true,(5-hour)%24,'full' end
-  if phase==5 and hour>=12 and hour<18 then return false,18-hour,'near' end
+  -- MoonPhase names the noon-to-noon cycle; midnight does not advance it.
+  if phase==5 then
+   if hour>=18 or hour<6 then return true,(6-hour)%24,'full','Full Moon' end
+   if hour>=12 then return false,18-hour,'near','Full Moon' end
+   return false,7*24+18-hour,'late','Full Moon'
+  end
   local steps=(5-phase)%8
-  if steps==0 then steps=8 end -- 05:00 to noon: the previous full moon ended.
-  local hours=(18-hour)%24+(steps-1)*24
-  local state=phase==4 and 'near' or phase==5 and 'late' or 'bad'
-  return false,hours,state
+  -- Before noon, today's phase transition still lies ahead of us.
+  local days=steps-(hour<12 and 1 or 0)
+  local hours=18-hour+days*24
+  return false,hours,phase==4 and 'near' or 'bad',phase==4 and 'Near Full Moon' or 'Bad Moon'
  end
  local eyeParts={};local eyeScanAt=0;local eyeIsland
  local sampleClock=lighting.ClockTime;local sampleAt=os.clock();local rate
@@ -5068,11 +5150,10 @@ do
    end
    local phase=tonumber(lighting:GetAttribute('MoonPhase'))
    if phase and phase>=1 and phase<=8 and phase%1==0 then
-    local full,hours,state=moonHours(phase,hour)
+    local full,hours,state,displayState=moonHours(phase,hour)
     preferences.MoonForecast={job=game.JobId,measuredAt=now,full=full,state=state,phase=phase,hour=hour,seconds=rate and hours/rate or nil}
-    local displayState=full and 'Full Moon' or state=='near' and (hour>=12 and hour<18 and 'Full Moon' or 'Near Full Moon') or 'Bad Moon'
     countdown.Text='Moon phase: '..displayState..' | '..string.format('%02d:%02d',math.floor(hour),math.floor(hour%1*60))
-    moonTimer.Text=(full and 'Full Moon ends in: ' or 'Full Moon in: ')..(rate and ('~'..formatTime(hours/rate)) or 'measuring server clock')
+    moonTimer.Text=state=='late' and 'Full Moon: already passed' or (full and 'Full Moon ends in: ' or 'Full Moon in: ')..(rate and ('~'..formatTime(hours/rate)) or 'measuring server clock')
    else
     preferences.MoonForecast=nil
     countdown.Text='Moon phase: unknown | '..string.format('%02d:%02d',math.floor(hour),math.floor(hour%1*60));moonTimer.Text='Full Moon in: unknown'
@@ -5378,36 +5459,29 @@ do
  end
  local function purchase(entry)
   if styleTool(entry) then return confirmStyle(entry) end
-  if entry.ownedOnly and remote:InvokeServer(entry.command,true)~=1 then return false,'Unlock '..entry.name..' first.' end
-  if entry.command=='DragonClaw' then
-   local eligible=remote:InvokeServer('BlackbeardReward','DragonClaw','1')
-   if eligible==false or eligible==nil then return false,'Dragon Breath is unavailable.' end
-  end
-  local beforeB,beforeF=balance()
-  local result=buyRequest(entry)
-  local confirmed,message=confirmStyle(entry);if confirmed then return true,message end
-  local afterB,afterF=balance()
-  if afterB<beforeB or afterF<beforeF then
-   return false,entry.name..': currency spent, but tool has not arrived. Stopped to avoid charging again.'
-  end
   if not alive then return false,'Closed' end
-  local position=npcPosition(teacherNames[entry.name] or {},nil)
-  if position then
-   say('Meeting '..teacherNames[entry.name][1]..' to equip '..entry.name)
-   sea.SetEnabled(false);travelAPI.Stop();otherFarm.PausePriority()
-   local buyToken=farm.SeaBegin()
-   local ok,success,detail=pcall(function()
-    if not farm.SeaMove(position,buyToken) or not alive or not farm.SeaActive(buyToken) then return false,'Travel cancelled.' end
-    task.wait(.4)
-    if entry.command=='DragonClaw' then remote:InvokeServer('BlackbeardReward','DragonClaw','1') end
-    result=buyRequest(entry)
-    return confirmStyle(entry)
-   end)
-   farm.SeaEnd(buyToken)
-   if not preferences.styleJob then otherFarm.ResumePriority() end
-   if ok and success then return true,detail end
-  end
-  return false,entry.name..' not equipped. Teacher reply: '..tostring(result)..'. Check unlocks, combat status and currency.'
+  say('Meeting '..(teacherNames[entry.name] or {entry.name})[1]..' to buy '..entry.name)
+  sea.SetEnabled(false);travelAPI.Stop();otherFarm.PausePriority()
+  local buyToken=farm.SeaBegin()
+  local ok,success,detail=pcall(function()
+   local position=npcPosition(teacherNames[entry.name] or {},nil)
+   if not position then return false,'Teacher not found in this sea. Use Get to unlock '..entry.name..'.' end
+   if not farm.SeaMove(position,buyToken) or not alive or not farm.SeaActive(buyToken) then return false,'Travel cancelled.' end
+   if entry.ownedOnly and remote:InvokeServer(entry.command,true)~=1 then return false,'Unlock '..entry.name..' first.' end
+   if entry.command=='DragonClaw' then remote:InvokeServer('BlackbeardReward','DragonClaw','1') end
+   local beforeB,beforeF=balance()
+   local result=buyRequest(entry)
+   -- Unlock quests belong to Get. Never retry a purchase after spending currency.
+   local confirmed,message=confirmStyle(entry)
+   if confirmed then return true,message end
+   local afterB,afterF=balance()
+   if afterB<beforeB or afterF<beforeF then return false,entry.name..': currency spent, but tool has not arrived. Stopped to avoid charging again.' end
+   return false,entry.name..' not equipped. '..(entry.get and 'Use Get if its quest is not completed. ' or '')..'Teacher reply: '..tostring(result)
+  end)
+  farm.SeaEnd(buyToken)
+  if not preferences.styleJob then otherFarm.ResumePriority() end
+  if not ok then return false,tostring(success) end
+  return success,detail
  end
  preferences.PurchaseStyle=function(name)
   if buyBusy then return false,'Purchase already in progress.' end
@@ -6291,7 +6365,9 @@ do
        status.Text=f.full and 'Found ✓ Full moon is active. Staying here.' or string.format('Found ✓  Full moon in ~%d min %02d sec. Staying here.',math.floor(f.seconds/60),math.floor(f.seconds)%60)
        notifyMoon('Matching server found ✓\n'..moonMessage(f)..'\nServer hopping stopped.',true)
       end
-     elseif measured or reject or os.clock()-searchStarted>8 then
+     elseif fresh and f.state=='near' and not measured then
+      matching=0;status.Text='Upcoming full moon — measuring countdown before deciding...'
+     elseif measured or reject or (not fresh and os.clock()-searchStarted>15) then
       matching=0
       if notifiedAt and os.clock()-notifiedAt>=.5 then
        local ok,message=preferences.RequestHop('moon')
@@ -6364,6 +6440,16 @@ do
   local data=player:FindFirstChild('Data');local r=data and data:FindFirstChild('Race');local name=r and races[r.Value]
   local origin=workspace:FindFirstChild('_WorldOrigin');local locations=origin and origin:FindFirstChild('Locations')
   local marker=name and locations and locations:FindFirstChild(name);local hr=root()
+  if name=='Trial of Flames' and hr then
+   local map=workspace:FindFirstChild('Map');local trial=map and map:FindFirstChild('DracoTrial')
+   local center=trial and trial:FindFirstChild('Center',true)
+   -- CurrentLocation briefly becomes Prehistoric Island between relics. Use the actual loaded room.
+   if center and center:IsA('BasePart') and (hr.Position-center.Position).Magnitude<2400 then return name,center end
+   local island=map and map:FindFirstChild('PrehistoricIsland')
+   local door=island and island:FindFirstChild('TrialTeleport',true)
+   if door and door:IsA('BasePart') and (hr.Position-door.Position).Magnitude<2400 then return 'Draco Entry',door end
+   return
+  end
   if not marker or not hr or (hr.Position-marker.Position).Magnitude>1800 then return end
   -- CurrentLocation/ExactLocation comes from the game, not from our own teleport.
   if player:GetAttribute('CurrentLocation')~=name and player:GetAttribute('ExactLocation')~=name then return end
@@ -6462,15 +6548,13 @@ do
     local previous=getIdentity and getIdentity() or 2
     pcall(function()
      if not enabled() then return end
-     camera.CameraType=Enum.CameraType.Scriptable;camera.CFrame=CFrame.lookAt(hr.Position+Vector3.new(0,4,0),target.Position);camera.Focus=CFrame.new(target.Position)
-     local point=camera:WorldToViewportPoint(target.Position);local inset=game:GetService('GuiService'):GetGuiInset()
+     farm.SetSkillAim(target.Position,token,target)
      if setIdentity then setIdentity(8) end
-     input:SendMouseMoveEvent(point.X+inset.X,point.Y+inset.Y,game)
      input:SendKeyEvent(true,key,false,game);task.wait(.1)
     end)
     pcall(function()input:SendKeyEvent(false,key,false,game)end)
     if setIdentity then setIdentity(previous) end
-    pcall(function()camera.CameraType=ct;camera.CFrame=cf;camera.Focus=focus;if old then mouse.Value=old end end)
+    farm.ClearSkillAim(token)
     return
    end
   end
@@ -6501,61 +6585,111 @@ do
   else farm.SeaAttack(best.enemy,token) end
   message.Text=water and 'Trial: rotating available skills on Sea Beast' or ('Trial: fighting '..best.enemy.Name)
  end
- -- Draco report: pickup Relic2/1/3, then the corresponding enabled EndRelic prompt.
+ -- Recorded 2026-11-06: TrialTeleport -> statue start -> 2/1/3 pickup + delivery -> TrialDoor.
+ local dracoState={model=nil,started=false,startAt=0,entryAt=0,exitAt=nil}
  local dracoPromptAt=setmetatable({},{__mode='k'})
- local function dracoTrial()
-  local map=workspace:FindFirstChild('Map');local trial=map and map:FindFirstChild('DracoTrial')
-  if not trial or not enabled() then message.Text='Waiting for Draco trial objects';return end
-  local function relicPrompt(name)
-   -- Several siblings share the name Model; resolve the relic by its prompt ancestry.
-   for _,candidate in ipairs(trial:GetDescendants()) do
-    if candidate:IsA('ProximityPrompt') then
-     local ancestor=candidate.Parent
-     while ancestor and ancestor~=trial do
-      if ancestor.Name==name then return candidate end
-      ancestor=ancestor.Parent
-     end
+ local function dracoObjective(trial)
+  local function prompt(name)
+   for _,p in ipairs(trial:GetDescendants()) do
+    if p:IsA('ProximityPrompt') then
+     local a=p.Parent
+     while a and a~=trial do if a.Name==name then return p end;a=a.Parent end
     end
    end
   end
-  local function redeemed(number)
-   local brazier=trial:FindFirstChild('Brazier'..number,true)
-   local slot=brazier and brazier:FindFirstChild('Relic'..number)
+  local delivered={};local count=0
+  for n=1,3 do
+   local brazier=trial:FindFirstChild('Brazier'..n,true)
+   local slot=brazier and brazier:FindFirstChild('Relic'..n)
    if slot then for _,fx in ipairs(slot:GetDescendants()) do
-    if fx:IsA('ParticleEmitter') and fx.Enabled and (fx.Name=='Fire' or fx.Name=='FireShaded' or fx.Name=='Embers') then return true end
+    if fx:IsA('ParticleEmitter') and fx.Enabled and (fx.Name=='Fire' or fx.Name=='FireShaded' or fx.Name=='Embers') then delivered[n]=true;break end
    end end
-   return false
+   if delivered[n] then count=count+1 end
   end
-  local count=0;for n=1,3 do if redeemed(n) then count=count+1 end end
-  if count==3 then farm.SeaRelease(token);message.Text='Draco: 3 relics delivered — waiting for game completion';return end
-  local chosen;local number;local delivering=false
+  if count==3 then return 'exit',nil,trial:FindFirstChild('TrialDoor'),count end
   for _,n in ipairs({2,1,3}) do
-   local p=relicPrompt('EndRelic'..n)
-   if not redeemed(n) and p and p.Enabled then chosen=p;number=n;delivering=true;break end
+   local p=prompt('EndRelic'..n)
+   if not delivered[n] and p and p.Enabled then return 'deliver',n,p,count end
   end
-  if not chosen then
-   for _,n in ipairs({2,1,3}) do
-    local p=relicPrompt('Relic'..n)
-    if not redeemed(n) and p and p.Enabled then chosen=p;number=n;break end
+  for _,n in ipairs({2,1,3}) do
+   local p=prompt('Relic'..n)
+   if not delivered[n] and p and p.Enabled then return 'pickup',n,p,count end
+  end
+  return 'wait',nil,nil,count
+ end
+ local function dracoEntry(door)
+  if not enabled() or not door or not door.Parent then return end
+  message.Text='Draco: entering the trial'
+  if os.clock()-dracoState.entryAt<3 then return end
+  dracoState.entryAt=os.clock()
+  local valid=function()return enabled() and door.Parent~=nil end
+  if farm.SeaMove(door.Position,token,valid) and valid() then
+   farm.SeaRelease(token)
+   local hr=root()
+   if hr and firetouchinterest then firetouchinterest(hr,door,0);task.wait(.05);firetouchinterest(hr,door,1) end
+   local deadline=os.clock()+3
+   repeat task.wait(.15) until not enabled() or os.clock()>deadline
+  end
+ end
+ local function dracoTrial()
+  local map=workspace:FindFirstChild('Map');local trial=map and map:FindFirstChild('DracoTrial')
+  if not trial or not enabled() then message.Text='Waiting for Draco trial objects';return end
+  if dracoState.model~=trial then dracoState.model=trial;dracoState.started=false;dracoState.startAt=0;dracoState.exitAt=nil end
+  local stage,number,chosen,count=dracoObjective(trial)
+  -- Delivery prompts and lit braziers are game confirmation that this trial is already started.
+  if stage=='deliver' or count>0 then dracoState.started=true end
+  if not dracoState.started then
+   message.Text='Draco: starting the trial at the statue'
+   if os.clock()-dracoState.startAt<4 then return end
+   dracoState.startAt=os.clock()
+   local statue=trial:FindFirstChild('DracoNpc')
+   if not statue then message.Text='Draco: waiting for the trial statue';return end
+   local position=statue:IsA('Model') and statue:GetPivot().Position or statue:IsA('BasePart') and statue.Position
+   if not position then return end
+   if not farm.SeaMove(position+Vector3.new(0,3,4),token,function()return enabled() and statue.Parent~=nil end) or not enabled() then return end
+   farm.SeaRelease(token)
+   -- Exact action used by DialoguesList.DracoStatue.Option1 (Yes), no guessed arguments.
+   local remote=game:GetService('ReplicatedStorage').Remotes:FindFirstChild('DracoTrial')
+   if not remote then message.Text='Draco: waiting for the start interaction';return end
+   remote:InvokeServer()
+   if not enabled() then return end
+   dracoState.started=true
+   task.wait(1.5)
+   return
+  end
+  if stage=='exit' then
+   dracoState.exitAt=dracoState.exitAt or os.clock()
+   -- Native door opening animation lasts four seconds after the last delivery.
+   if os.clock()-dracoState.exitAt<4 then farm.SeaRelease(token);message.Text='Draco: relics delivered; waiting for the exit to open';return end
+   if not chosen then message.Text='Draco: waiting for TrialDoor';return end
+   local destination=chosen:IsA('Model') and chosen:GetPivot().Position or chosen:IsA('BasePart') and chosen.Position
+   if not destination then return end
+   message.Text='Draco: leaving through the completed trial door'
+   if farm.SeaMove(destination,token,function()return enabled() and chosen.Parent~=nil end) and enabled() then
+    farm.SeaRelease(token)
+    local hr=root();local touch=chosen:IsA('BasePart') and chosen or chosen:IsA('Model') and chosen.PrimaryPart
+    if hr and touch and firetouchinterest then firetouchinterest(hr,touch,0);task.wait(.05);firetouchinterest(hr,touch,1) end
    end
+   return
   end
-  if not chosen then farm.SeaRelease(token);message.Text='Draco: waiting for pickup / delivery confirmation';return end
+  dracoState.exitAt=nil
+  if stage=='wait' then farm.SeaRelease(token);message.Text='Draco: waiting for pickup / delivery confirmation';return end
   local anchor=chosen.Parent
   local destination=anchor:IsA('Attachment') and anchor.WorldPosition or anchor:IsA('BasePart') and anchor.Position
   if not destination then message.Text='Draco prompt anchor not loaded';return end
-  message.Text='Draco: '..(delivering and 'delivering' or 'collecting')..' relic '..number..' ('..count..'/3)'
+  message.Text='Draco: '..(stage=='deliver' and 'delivering' or 'collecting')..' relic '..number..' ('..count..'/3)'
   local holdPoint=destination+Vector3.new(0,2,2)
+  local valid=function()return enabled() and chosen.Parent~=nil and chosen.Enabled end
   local current=root();local arrived=current and (current.Position-holdPoint).Magnitude<5
-  if not arrived then arrived=farm.SeaMove(holdPoint,token,function() return enabled() and chosen.Parent~=nil and chosen.Enabled end) end
-  if not arrived or not enabled() or not chosen.Parent or not chosen.Enabled then return end
+  if not arrived then arrived=farm.SeaMove(holdPoint,token,valid) end
+  if not arrived or not valid() then return end
   farm.SeaHold(holdPoint,token)
   local hr=root();if not hr or (hr.Position-destination).Magnitude>chosen.MaxActivationDistance then return end
   if os.clock()-(dracoPromptAt[chosen] or 0)<2 then return end
   dracoPromptAt[chosen]=os.clock()
   if fireproximityprompt then fireproximityprompt(chosen)
   else chosen:InputHoldBegin();task.wait(chosen.HoldDuration+.1);chosen:InputHoldEnd() end
-  -- Neither pressing the prompt nor reaching the point counts as completion.
-  message.Text='Draco: waiting for game to confirm relic '..number
+  message.Text='Draco: waiting for game confirmation of relic '..number
  end
  bindControl(toggle,'Activated',function()
   preferences.autoTrial=not preferences.autoTrial
@@ -6579,7 +6713,8 @@ do
        message.Text='Waiting for the Rabbit red finish pad to load';return
       end
       takeControl(name)
-      if name=='Trial of Strength' or name=='Trial of Carnage' or name=='Trial of Water' then fight(marker,name=='Trial of Water')
+      if name=='Draco Entry' then dracoEntry(marker)
+      elseif name=='Trial of Strength' or name=='Trial of Carnage' or name=='Trial of Water' then fight(marker,name=='Trial of Water')
       elseif name=='Trial of Flames' then dracoTrial()
       elseif name=='Trial of the Machine' then machineTrial()
       elseif name=='Trial of the King' or name=='Trial of Speed' then
@@ -7022,7 +7157,7 @@ do
  local function installLeviathan()
  local rs=game:GetService('ReplicatedStorage');local players=game:GetService('Players')
  local panel=panels['Sea Event'];local token;local serial=0;local boat;local seat;local driving
- local sailingCollisions={};local sailingVelocity={};local flying;local phase='idle';local chosen;local noDamage={};local tracked={};local hadBoss=false;local damageDone={}
+ local sailingCollisions={};local sailingVelocity={};local flying;local phase='idle';local chosen;local noDamage={};local tracked={};local hadBoss=false
  local arrivalCharacter;local arrivalPoint
  local bodyParts={};local arrived=false;local savedWeapon;local savedTool;local pending=false;local boatBuyAt=0
  local TIKI=Vector3.new(-16929,8,435)
@@ -7099,7 +7234,7 @@ do
  local function stop()
   if boat and boat.Parent and seat and seat.Parent then rememberedPosition=seat.Position;rememberedOwner=config().owner;recoverBoat=true end
   local keepHeart=phase=='heart-done' or phase=='heart-return' or phase=='heart-arrived'
-  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};hadBoss=false;damageDone={}
+  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};hadBoss=false
  end
  local function claim()
   if token and farm.SeaActive(token) then return true end
@@ -7284,81 +7419,39 @@ do
   end)
  end
  local function health(object)
-  if not object then return nil end
   local h=object:FindFirstChildOfClass('Humanoid');if h then return h.Health end
   local hp=object:FindFirstChild('Health') or object:FindFirstChild('HP')
   if hp and hp:IsA('ValueBase') then return tonumber(hp.Value) end
-  local attr=tonumber(object:GetAttribute('Health')) or tonumber(object:GetAttribute('HP'))
-  if attr then return attr end
-  if object:IsA('BasePart') and object.Parent and object.Parent:IsA('Model') then
-   local ph=object.Parent:FindFirstChildOfClass('Humanoid')
-   if ph then return ph.Health end
-  end
-  return nil
+  return tonumber(object:GetAttribute('Health')) or tonumber(object:GetAttribute('HP'))
  end
  local function segments()
-  local seen={}
-  local bodyList={}
-  local headList={}
+  local result={};local seen={}
   for _,folder in pairs({workspace:FindFirstChild('SeaBeasts'),workspace:FindFirstChild('Enemies'),workspace}) do
    for _,boss in ipairs(folder:GetChildren()) do if boss:IsA('Model') and boss.Name:lower():find('leviathan',1,true) then
     local candidates={boss};for _,v in ipairs(boss:GetDescendants()) do if v:IsA('Model') or v:IsA('BasePart') then table.insert(candidates,v) end end
     for _,v in ipairs(candidates) do
-     local hp=health(v);local p=v:IsA('BasePart') and v or v:FindFirstChild('HumanoidRootPart') or v.PrimaryPart or v:FindFirstChild('Head') or v:FindFirstChildWhichIsA('BasePart',true)
+     local hp=health(v);local p=v:IsA('BasePart') and v or v:FindFirstChild('HumanoidRootPart') or v.PrimaryPart
      if hp and p and not seen[v] then
       seen[v]=true;tracked[v]=hp;hadBoss=true
-      local n=v.Name:lower()
-      local isHead=n:find('head',1,true)~=nil or n:find('main',1,true)~=nil
-      local explicitBody=n:find('segment',1,true)~=nil or n:find('body',1,true)~=nil or n:find('tail',1,true)~=nil
-      local isMain=isHead or (v==boss and not explicitBody)
+      local n=v.Name:lower();local main=n:find('head',1,true) or n:find('tail',1,true) or n:find('main',1,true)
+      local explicitBody=n:find('segment',1,true) or n:find('body',1,true)
+      local isMain=main or (v==boss and not explicitBody)
       if not isMain then bodyParts[v]=hp end
       local blocked=v:GetAttribute('Invulnerable')==true or v:GetAttribute('CanDamage')==false or v:GetAttribute('Damageable')==false
-      if hp>0 and not blocked then
-       local entry={object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain}
-       if isMain then
-        table.insert(headList,entry)
-       else
-        table.insert(bodyList,entry)
-       end
-      end
+      if hp>0 and not blocked then table.insert(result,{object=v,model=v:IsA('Model') and v or boss,part=p,hp=hp,main=isMain}) end
      end
     end
    end end
   end
-  -- 1. If Segments are alive in Workspace -> attack Segments only (do not target head)
-  if #bodyList>0 then
-   return bodyList
-  end
-
-  -- 2. Verify status of all tracked Segments
   local count,dead=0,0
   for object,lastHP in pairs(bodyParts) do
-   count=count+1
-   local isDead=false
-   if not object or not object.Parent or not object:IsDescendantOf(workspace) then
-    isDead=true
-   else
-    local hp=health(object)
-    if not hp or hp<=0 then isDead=true end
-   end
-   if isDead then dead=dead+1 end
+   count=count+1;local hp=object.Parent and health(object) or lastHP
+   if hp and hp<=0 then dead=dead+1 end
   end
-
-  -- 3. If just spawned and Segments not streamed in yet (count == 0) -> wait for Segments to load
-  if count==0 and #headList>0 then
-   status.Text='Waiting for Leviathan segments to load'
-   return {}
-  end
-
-  -- 4. When all Segments are confirmed dead or no Segments remain (#bodyList == 0)
-  --    -> target Leviathan Head until dead
-  local segmentsConfirmedDead=(count>0 and dead>=count) or (count>0 and #bodyList==0) or (hadBoss and #bodyList==0)
-  if segmentsConfirmedDead and #headList>0 then
-   for _,v in ipairs(headList) do noDamage[v.object]=nil end
-   return headList
-  end
-
-  return {}
+  -- Do not infer that the main section is unlocked merely because other sections are not streamed in.
+  local mainReady=count>=3 and dead==count
+  local filtered={};for _,v in ipairs(result) do if not v.main or mainReady then table.insert(filtered,v) end end
+  return filtered
  end
  local function combat(target,id)
   stopDrive();phase='combat';local h,r=body();if not h then return end
@@ -7369,31 +7462,13 @@ do
   if (r.Position-point).Magnitude>70 then if not move(point+Vector3.new(0,18,10),id) then return end end
   farm.SeaHover(target.part,token,18,false)
   local startHP=health(target.object);local deadline=os.clock()+5
-  local lastHP=startHP;local preCombat=damageDone[target.object] or 0
+  status.Text='Attacking '..target.object.Name
   repeat
    if not active(id) or not config().attack or not target.part.Parent then return end
    local hp=health(target.object);if not hp or hp<=0 then return end
-   -- Track HP drop in loop
-   if hp<lastHP then
-    damageDone[target.object]=(damageDone[target.object] or 0)+(lastHP-hp)
-    lastHP=hp
-   end
-   if target.main then
-    status.Text='Attacking Leviathan Head ['..math.floor(hp)..' HP remaining]'
-   else
-    status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/25000 HP]'
-   end
-   -- Exit at 25000 HP for segment rotation; if head/main, keep attacking until dead
-   if not target.main and (damageDone[target.object] or 0)>=25000 then
-    status.Text='25000 HP dealt on '..target.object.Name..'; rotating to next segment'
-    return
-   end
    farm.SeaAttackPart(target.model,target.part,token);task.wait(.08)
   until os.clock()>deadline
-  -- Check no-damage if combat loop times out with 0 damage
-  if (damageDone[target.object] or 0)==preCombat then
-   noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment'
-  end
+  if health(target.object)==startHP then noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment' end
  end
  local heartTarget;local heartScanAt=0;local heartShotAt=0;local heartShots=0;local shotObjects={}
  local function findHeart()
@@ -7547,30 +7622,13 @@ do
   if phase=='heart-arrived' then return end
   if c.attack then
    local list=segments();local target
-   -- Select segment with expired noDamage and (damageDone < 25000 or is main/head)
-   for _,v in ipairs(list) do
-    if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<25000) then
-     target=v;break
-    end
-   end
-   -- If all segments dealt >= 25000 HP -> reset rotation cycle
-   if not target then
-    local allRotated=true
-    for _,v in ipairs(list) do
-     if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<25000) then allRotated=false;break end
-    end
-    if allRotated and #list>0 then
-     for _,v in ipairs(list) do damageDone[v.object]=0 end
-     status.Text='Rotation cycle complete; restarting 25000 HP cycle'
-     return
-    end
-   end
+   for _,v in ipairs(list) do if (noDamage[v.object] or 0)<os.clock() then target=v;break end end
    if target then combat(target,id);return end
    if #list>0 then stopDrive();status.Text='Waiting to retry damageable Leviathan segments';return end
    if hadBoss and #list==0 then
     local complete=true;for object,lastHP in pairs(tracked) do
      local hp=object.Parent and health(object) or nil
-     if hp~=nil then tracked[object]=hp end
+     if hp~=nil then tracked[object]=hp elseif lastHP>0 then complete=false end
      if hp and hp>0 then complete=false end
     end
     if complete then c.attack=false;c.hunt=false;c.ride=true;phase='return';status.Text='Leviathan defeated; returning to boat';hadBoss=false;task.defer(preferences.Flush)
@@ -7749,6 +7807,10 @@ do
  local rengokuStatus=label(items,'',18,478,478,60,11);rengokuStatus.TextWrapped=true
  items.CanvasSize=UDim2.fromOffset(0,552)
  local rengokuPending=0;local rengokuRetry=0
+ label(stack,'Auto Spawn Soul Reaper',18,674,380,30,13)
+ local reaperButton=control(stack,'OFF',410,676,80,28)
+ local reaperStatus=label(stack,'',18,712,478,42,11);reaperStatus.TextWrapped=true
+ local reaperPending=0;local reaperRetry=0
  -- Insert directly below Kill Darkbeard, keeping later rows aligned.
  for _,v in ipairs(stack:GetChildren()) do
   if v:IsA('GuiObject') and v.Position.Y.Offset>=264 then
@@ -7758,9 +7820,9 @@ do
  label(stack,'Auto Spawn Darkbeard',18,264,380,30,13)
  local darkButton=control(stack,'OFF',410,266,80,28);bindingObjects[darkButton].title="Auto Spawn Darkbeard"
  local darkStatus=label(stack,'',18,604,478,42,11);darkStatus.TextWrapped=true
- stack.CanvasSize=UDim2.fromOffset(0,660)
+ stack.CanvasSize=UDim2.fromOffset(0,800)
  local darkPending=0;local darkRetry=0
- local token;local serial=0;local owner;local resume;local torchIndex=1;local torchDeadline;local requestBusy=false
+ local token;local serial=0;local owner;local resume;local torchIndex=1;local torchDeadline;local requestBusy=false;local portalWaitUntil=0
  local function tool(name)
   for _,root in pairs({player.Character,player:FindFirstChild('Backpack')}) do
    local t=root:FindFirstChild(name);if t and t:IsA('Tool') then return t end
@@ -7776,20 +7838,20 @@ do
    if e.Name:lower():find(name,1,true) and h and h.Health>0 then return e end
   end
   -- Streamed-out live bosses are kept directly in ReplicatedStorage.
-  if name=='rip_indra' or name=='dough king' or name=='darkbeard' then for _,e in ipairs(rs:GetChildren()) do
+  if name=='rip_indra' or name=='dough king' or name=='darkbeard' or name=='soul reaper' then for _,e in ipairs(rs:GetChildren()) do
    if e:IsA('Model') and e.Name:lower():find(name,1,true) then local h=e:FindFirstChildOfClass('Humanoid');if h and h.Health>0 then return e end end
   end end
  end
  local function active(id)
-  return alive and serial==id and token and farm.SeaActive(token) and (owner=='rengoku' and preferences.autoRengoku or owner=='dark' and preferences.autoSpawnDarkbeard or owner=='spawn' and preferences.autoSpawnIndra or owner=='tushita' and preferences.autoTushita or owner=='dough' and preferences.autoSpawnDoughKing)
+  return alive and serial==id and token and farm.SeaActive(token) and (owner=='rengoku' and preferences.autoRengoku or owner=='dark' and preferences.autoSpawnDarkbeard or owner=='spawn' and preferences.autoSpawnIndra or owner=='tushita' and preferences.autoTushita or owner=='dough' and preferences.autoSpawnDoughKing or owner=='reaper' and preferences.autoSpawnReaper)
  end
  local function release()
   local canResume=token and farm.SeaActive(token)
   serial=serial+1;if token then farm.SeaEnd(token);token=nil end
-  preferences.itemQuestBusy=false;otherFarm.ResumePriority()
+  preferences.itemQuestBusy=false;farm.stackSuspended=false;otherFarm.ResumePriority()
   local old=resume;resume=nil;owner=nil
   if old and alive and canResume then
-   for k,v in pairs(old.events) do farm.stackEvents[k]=v end
+   -- Kill selections are live user intent; never restore an old snapshot over them.
    farm.stackFruit=old.stackFruit;farm.SetAutoClick(old.autoClick)
    if not (preferences.HasRareItem and preferences.HasRareItem()) then farm.SetMode(old.mode,old.enabled) end
   end
@@ -7797,11 +7859,11 @@ do
  local function claim(job)
   if token and owner==job and farm.SeaActive(token) then return true end
   if token then release() end
-  if preferences.styleJob or preferences.autoSaber or preferences.priorityBusy then return false end
+  if preferences.autoCDK or preferences.styleJob or preferences.autoSaber or preferences.priorityBusy then return false end
   resume={mode=farm.mode,enabled=farm.enabled,events=table.clone(farm.stackEvents),stackFruit=farm.stackFruit,autoClick=farm.autoClick}
   preferences.itemQuestBusy=true;otherFarm.PausePriority();sea.SetEnabled(false);travelAPI.Stop()
   if preferences.CancelAllHop then preferences.CancelAllHop() end
-  for k in pairs(farm.stackEvents) do farm.stackEvents[k]=false end
+  farm.stackSuspended=true
   farm.SetEnabled(false);farm.SetStackFruit(false);farm.SetAutoClick(false)
   owner=job;token=farm.SeaBegin();return true
  end
@@ -7934,11 +7996,30 @@ do
   return light and light.Enabled or emitter and emitter.Enabled
  end
  local function finishTushita()
-  preferences.autoTushita=false;questStatus.Text='Tushita obtained';torchDeadline=nil;torchIndex=1;release();preferences.Flush()
+  preferences.autoTushita=false;questStatus.Text='Tushita obtained';torchDeadline=nil;torchIndex=1;portalWaitUntil=0;release();preferences.Flush()
+ end
+ local tushitaPortalPoint=Vector3.new(5713.538,38.383,255.202)
+ local function tushitaPortal()
+  local map=workspace:FindFirstChild('Map');if not map then return end
+  local waterfall=map:FindFirstChild('Waterfall');local best,distance
+  for _,part in ipairs((waterfall or map):GetDescendants())do
+   if part:IsA('BasePart')and part.CanTouch then
+    local n=part.Name:lower():gsub('[^%a]','')
+    local d=(part.Position-tushitaPortalPoint).Magnitude
+    if d<120 and(n=='hitbox'or n=='teleport'or n=='portal'or n=='tushitaportal')and(not distance or d<distance)then best=part;distance=d end
+   end
+  end
+  return best
+ end
+ local function reachedTushita()
+  if tool('Holy Torch')then return true end
+  local _,r=body()
+  return r and(r.Position-Vector3.new(-12000,400,-8500)).Magnitude<6500
  end
  local function tushita(id)
   if owns('Tushita','Moveset') then finishTushita();return end
   local holy=tool('Holy Torch')
+  if holy then portalWaitUntil=0 elseif os.clock()<portalWaitUntil then questStatus.Text='Portal entered — waiting for Holy Torch';return end
   if holy or torchIndex>1 then
    if not torchDeadline then torchDeadline=os.clock()+300 end
    if os.clock()>torchDeadline and torchIndex<=5 then
@@ -7962,23 +8043,29 @@ do
   end
   if not enemy('rip_indra') then questStatus.Text='Waiting for Indra to spawn';return end
   questStatus.Text='Travelling directly to the Tushita portal'
-  local gate
-  for _,v in ipairs(workspace.Map:GetDescendants()) do
-   local n=v.Name:lower():gsub('[^%a]','')
-   if n=='tushitagate' or n=='tushitadoor' or n=='tushitaportal' or ((n=='gate' or n=='door' or n=='teleport' or n=='portal') and v:GetFullName():lower():find('secretroom',1,true)) then
-    local pos=point(v)
-    if pos and (pos-Vector3.new(5387,76,503)).Magnitude<1500 then gate=v;break end
-   end
-  end
-  local part=gate and (gate:IsA('BasePart') and gate or gate:FindFirstChild('Hitbox',true) or gate:FindFirstChildWhichIsA('BasePart',true))
-  if not part then
-   questStatus.Text='Loading the Tushita portal'
-   local origin=workspace:FindFirstChild('_WorldOrigin');local locations=origin and origin:FindFirstChild('Locations')
-   local temple=locations and locations:FindFirstChild('Secret Temple')
-   move(temple and temple.Position+Vector3.new(0,3,0) or Vector3.new(5226.19,66.52,858.84),id)
-   return
-  end
-  questStatus.Text='Entering Tushita gate';touch(part,id,nil,function()return tool('Holy Torch')~=nil end)
+  local part=tushitaPortal()
+  local destination=part and part.Position or tushitaPortalPoint
+  local _,approachRoot=body()
+  local approached=approachRoot and(approachRoot.Position-destination).Magnitude<150
+  local watcher=approachRoot and approachRoot:GetPropertyChangedSignal('CFrame'):Connect(function()
+   if approachRoot.Parent and(approachRoot.Position-destination).Magnitude<150 then approached=true end
+  end)
+  local ok,arrived=pcall(move,destination,id)
+  if watcher then watcher:Disconnect()end
+  if not ok then error(arrived,0)end
+  if not active(id)then return end
+  -- Arrival on Turtle counts only after actually approaching this portal.
+  if tool('Holy Torch')or(approached and reachedTushita())then portalWaitUntil=os.clock()+8;questStatus.Text='Portal entered — waiting for Holy Torch';return end
+  if not arrived then questStatus.Text='Approaching Tushita portal';return end
+  farm.SeaRelease(token)
+  part=tushitaPortal()
+  if not part then questStatus.Text='At Tushita portal — waiting for it to load';return end
+  questStatus.Text='Entering Tushita portal'
+  touch(part,id,nil,reachedTushita)
+  if not active(id)then return end
+  local deadline=os.clock()+4
+  repeat task.wait(.1)until not active(id)or reachedTushita()or os.clock()>=deadline
+  if active(id)and reachedTushita()then portalWaitUntil=os.clock()+8 end
  end
  local doughRetry=0;local doughHadSweet=false;local doughPollAt=0;local doughReply
  local function dough(id)
@@ -8058,6 +8145,35 @@ do
   darkPending=os.clock()+12;darkRetry=os.clock()+3
   touch(detection,id,'Fist of Darkness',function()return enemy('darkbeard')~=nil or not tool('Fist of Darkness')end)
  end
+ local function summonReaper(id)
+  if enemy('soul reaper') then
+   preferences.autoSpawnReaper=false;reaperPending=0;reaperStatus.Text='Soul Reaper spawned';release();preferences.Flush();return
+  end
+  if not tool('Hallow Essence') then
+   if reaperPending>0 and os.clock()>=reaperPending then
+    preferences.autoSpawnReaper=false;reaperPending=0;reaperStatus.Text='Essence consumed; spawn not confirmed';release();preferences.Flush()
+   else reaperStatus.Text='Waiting for Soul Reaper to appear' end
+   return
+  end
+  if os.clock()<reaperRetry then return end
+  reaperRetry=os.clock()+3
+  local map=workspace:FindFirstChild('Map')
+  local castle=map and (map:FindFirstChild('HauntedCastle') or map:FindFirstChild('Haunted Castle'))
+  local summoner=castle and (castle:FindFirstChild('Summoner',true) or castle:FindFirstChild('SoulReaperSummoner',true) or castle:FindFirstChild('HallowEssenceAltar',true))
+  local detection=summoner and (summoner:FindFirstChild('Detection',true) or summoner:FindFirstChild('Hitbox',true))
+  if not detection and summoner then
+   if summoner:IsA('BasePart') then detection=summoner
+   else for _,part in ipairs(summoner:GetDescendants())do if part:IsA('TouchTransmitter') and part.Parent:IsA('BasePart')then detection=part.Parent;break end end end
+  end
+  if not detection or not detection:IsA('BasePart')then
+   reaperStatus.Text='Loading the Haunted Castle summon altar'
+   move(Vector3.new(-9514.07,142.14,5547),id);return
+  end
+  reaperStatus.Text='Summoning Soul Reaper';equip('Hallow Essence')
+  if not move(detection.Position+Vector3.new(0,2,0),id)then return end
+  reaperPending=os.clock()+15
+  touch(detection,id,'Hallow Essence',function()return enemy('soul reaper')~=nil or not tool('Hallow Essence')end)
+ end
  local function getRengoku(id)
   if owns('Rengoku','Moveset') then
    preferences.autoRengoku=false;rengokuPending=0;rengokuStatus.Text='Rengoku owned';release();preferences.Flush();return
@@ -8100,13 +8216,20 @@ do
  local function setToggle(key,on)
   preferences[key]=on==true;release()
   if key=='autoRengoku' then rengokuPending=0;rengokuRetry=0 end
+  if key=='autoSpawnReaper' then reaperPending=0;reaperRetry=0 end
   if key=='autoSpawnDarkbeard' then darkPending=0;darkRetry=0 end
   if key=='autoSpawnDoughKing' then doughRetry=0;doughHadSweet=false;doughPollAt=0;doughReply=nil;preferences.doughExchangeUntil=nil end
   if key=='autoSpawnIndra' then colorIndex=1 end
-  if key=='autoTushita' and not on then torchDeadline=nil;torchIndex=1 end
+  if key=='autoTushita' and not on then torchDeadline=nil;torchIndex=1;portalWaitUntil=0 end
   preferences.Flush()
  end
+ preferences.SetSummonBoss=function(key,on)
+  local allowed={autoSpawnIndra=true,autoSpawnDoughKing=true,autoSpawnDarkbeard=true,autoSpawnReaper=true}
+  if allowed[key] then setToggle(key,on) end
+ end
+ bindControl(reaperButton,'Activated',function()if preferenceReady then setToggle('autoSpawnReaper',not preferences.autoSpawnReaper)end end)
  preferences.SetAutoTushita=function(on) setToggle('autoTushita',on) end
+ preferences.TushitaSnapshot=function()return {enabled=preferences.autoTushita,status=questStatus.Text,torch=torchIndex,portal=tushitaPortalPoint,portalLoaded=tushitaPortal()~=nil}end
  bindControl(rengokuButton,'Activated',function()if preferenceReady then setToggle('autoRengoku',not preferences.autoRengoku)end end)
  bindControl(darkButton,'Activated',function()if preferenceReady then setToggle('autoSpawnDarkbeard',not preferences.autoSpawnDarkbeard)end end)
  bindControl(doughButton,'Activated',function()if preferenceReady then setToggle('autoSpawnDoughKing',not preferences.autoSpawnDoughKing);doughRetry=0 end end)
@@ -8119,6 +8242,7 @@ do
   while alive do
    if preferenceReady then
     farm.blockIndraForTushita=preferences.autoTushita==true and not tool('Holy Torch') and torchIndex==1
+    reaperButton.Text=preferences.autoSpawnReaper and 'ON' or 'OFF'
     rengokuButton.Text=preferences.autoRengoku and 'ON' or 'OFF'
     darkButton.Text=preferences.autoSpawnDarkbeard and 'ON' or 'OFF'
     doughButton.Text=preferences.autoSpawnDoughKing and 'ON' or 'OFF'
@@ -8131,10 +8255,12 @@ do
     elseif preferences.autoSpawnDarkbeard and sea2 and (tool('Fist of Darkness') or darkPending>0 or enemy('darkbeard')) then wanted='dark'
     elseif preferences.autoSpawnDoughKing and sea3 and (tool("God's Chalice") or tool('God Chalice') or tool('Sweet Chalice') or os.clock()<(preferences.doughExchangeUntil or 0) or enemy('dough king')) then wanted='dough'
     elseif preferences.autoTushita and sea3 and level and level.Value>=2000 and (enemy('rip_indra') or tool('Holy Torch') or torchIndex>1 or owns('Tushita','Moveset')) then wanted='tushita'
+    elseif preferences.autoSpawnReaper and sea3 and (tool('Hallow Essence') or reaperPending>0 or enemy('soul reaper')) then wanted='reaper'
     elseif preferences.autoSpawnIndra and sea3 and (tool("God's Chalice") or tool('God Chalice') or enemy('rip_indra')) then wanted='spawn' end
     if token and not farm.SeaActive(token) then
      local interrupted=owner;release();wanted=nil
      if interrupted=='rengoku' then preferences.autoRengoku=false;rengokuPending=0;rengokuStatus.Text='Stopped: another task took control'
+     elseif interrupted=='reaper' then preferences.autoSpawnReaper=false;reaperPending=0;reaperStatus.Text='Stopped: another task took control'
      elseif interrupted=='dark' then preferences.autoSpawnDarkbeard=false;darkPending=0;darkStatus.Text='Stopped: another task took control'
      elseif interrupted=='spawn' then preferences.autoSpawnIndra=false;spawnStatus.Text='Stopped: another task took control'
      elseif interrupted=='dough' then preferences.autoSpawnDoughKing=false;doughStatus.Text='Stopped: another task took control';preferences.doughExchangeUntil=nil
@@ -8142,11 +8268,12 @@ do
      preferences.Flush()
     end
     if wanted and claim(wanted) then
-     local ok,err=pcall(wanted=='rengoku' and getRengoku or wanted=='dark' and summonDark or wanted=='dough' and dough or wanted=='spawn' and summon or tushita,serial)
-     if not ok then local text='Waiting: '..tostring(err);if wanted=='rengoku' then rengokuStatus.Text=text elseif wanted=='dark' then darkStatus.Text=text elseif wanted=='dough' then doughStatus.Text=text elseif wanted=='spawn' then spawnStatus.Text=text else questStatus.Text=text end end
+     local ok,err=pcall(wanted=='reaper' and summonReaper or wanted=='rengoku' and getRengoku or wanted=='dark' and summonDark or wanted=='dough' and dough or wanted=='spawn' and summon or tushita,serial)
+     if not ok then local text='Waiting: '..tostring(err);if wanted=='reaper' then reaperStatus.Text=text elseif wanted=='rengoku' then rengokuStatus.Text=text elseif wanted=='dark' then darkStatus.Text=text elseif wanted=='dough' then doughStatus.Text=text elseif wanted=='spawn' then spawnStatus.Text=text else questStatus.Text=text end end
     elseif not wanted and token then release()
     elseif not wanted then
      if preferences.autoRengoku then rengokuStatus.Text='Requires Second Sea' end
+     if preferences.autoSpawnReaper then reaperStatus.Text=sea3 and 'Waiting for Hallow Essence' or 'Requires Third Sea' end
      if preferences.autoSpawnDarkbeard then darkStatus.Text=sea2 and 'Waiting for Fist of Darkness' or 'Requires Second Sea' end
      if preferences.autoSpawnDoughKing then doughStatus.Text=sea3 and "Waiting for God's Chalice" or 'Requires Third Sea' end
      if preferences.autoSpawnIndra then spawnStatus.Text=sea3 and "Waiting for God's Chalice" or 'Requires Third Sea' end
@@ -8500,21 +8627,542 @@ do
   stopOwnedJobs()
  end)
 end
+-- Halloween pumpkin cycle; isolated from the other farm controllers.
+;(function()
+ local enabled=false;local token;local status='OFF';local target;local encounter;local waitUntil=0;local skipped={};local attackedAt=0;local clickAt=0
+ local function body()
+  local c=player.Character;local h=c and c:FindFirstChildOfClass('Humanoid');local r=c and c:FindFirstChild('HumanoidRootPart')
+  if h and h.Health>0 and r then return c,h,r end
+ end
+ local function active()return alive and enabled and token and farm.SeaActive(token)end
+ local function stop()
+  enabled=false;target=nil;encounter=nil;waitUntil=0
+  if token then farm.SeaEnd(token);token=nil end
+  farm.stackSuspended=false;otherFarm.ResumePriority();status='OFF'
+ end
+ local function start(on)
+  if not on then stop();return end
+  if enabled then return end
+  preferences.StopAll();enabled=true;skipped={};target=nil;encounter=nil;waitUntil=0
+  farm.stackSuspended=true;otherFarm.PausePriority();token=farm.SeaBegin();status='Finding Halloween pumpkins'
+ end
+ local function zombie(origin)
+  local best,dist;local folder=workspace:FindFirstChild('Enemies')
+  for _,e in ipairs(folder and folder:GetChildren()or{})do
+   local n=e.Name:lower();local h=e:FindFirstChildOfClass('Humanoid');local r=e:FindFirstChild('HumanoidRootPart');local owner=e:GetAttribute('LocalEnemy')
+   if h and h.Health>0 and r and(not owner or owner==player.Name)and(n:find('zombie',1,true)or n=="jack o' lantern"or n=='pumpkin snowman')then
+    local d=(r.Position-origin).Magnitude;if d<180 and(not dist or d<dist)then best=e;dist=d end
+   end
+  end
+  return best
+ end
+ local function pumpkin(origin)
+  local best,dist;local folder=workspace:FindFirstChild('PumpkinHunt')
+  for _,m in ipairs(folder and folder:GetChildren()or{})do
+   local r=m:FindFirstChild('RootPart')
+   if r and m:GetAttribute('PumpkinState')=='Idle'and os.clock()>=(skipped[m]or 0)then
+    local d=(r.Position-origin).Magnitude;if not dist or d<dist then best=m;dist=d end
+   end
+  end
+  return best
+ end
+ local function step()
+  local c,h,r=body();if not r then status='Waiting for respawn';return end
+  if not token or not farm.SeaActive(token)then stop();return end
+  local enemy=encounter and zombie(encounter)or zombie(r.Position)
+  if enemy then
+   status='Defeating '..enemy.Name;local er=enemy.HumanoidRootPart
+   if (r.Position-er.Position).Magnitude>25 then farm.SeaMove(er.Position+Vector3.new(0,12,0),token,function()return active()and enemy.Parent and enemy.Humanoid.Health>0 end)end
+   if active()and enemy.Parent and enemy.Humanoid.Health>0 then farm.SeaHover(er,token,12,false);farm.SeaAttack(enemy,token)end
+   waitUntil=os.clock()+.6;return
+  end
+  if encounter and os.clock()<waitUntil then status='Checking pumpkin spawn';return end
+  encounter=nil
+  if target and(not target.Parent or target:GetAttribute('PumpkinState')~='Idle')then
+   local part=target:FindFirstChild('RootPart');encounter=part and part.Position;waitUntil=os.clock()+2.6;target=nil;return
+  end
+  if not target then target=pumpkin(r.Position);attackedAt=os.clock()end
+  if not target then status='Waiting for Halloween pumpkins';farm.SeaRelease(token);task.wait(.4);return end
+  local part=target:FindFirstChild('RootPart');if not part then target=nil;return end
+  status='Breaking pumpkin'
+  if (r.Position-part.Position).Magnitude>8 then
+   local delta=r.Position-part.Position;local flat=Vector3.new(delta.X,0,delta.Z);if flat.Magnitude<.01 then flat=Vector3.new(0,0,1)end
+   local arrived=farm.SeaMove(part.Position+flat.Unit*5+Vector3.new(0,2,0),token,function()return active()and target and target.Parent and target:GetAttribute('PumpkinState')=='Idle'end)
+   if not active()then return end
+   farm.SeaRelease(token);attackedAt=os.clock();if not arrived then skipped[target]=os.clock()+10;target=nil;return end
+  end
+  r.CFrame=CFrame.lookAt(r.Position,Vector3.new(part.Position.X,r.Position.Y,part.Position.Z))
+  local t=c:FindFirstChildOfClass('Tool')
+  if not t then farm.SeaAttackPart(target,part,token);return end
+  if os.clock()>=clickAt then
+   clickAt=os.clock()+.3
+   local input=game:GetService('VirtualInputManager');local set=setthreadidentity or setidentity;local get=getthreadidentity or getidentity;local previous=get and get()or 2
+   if set then set(8)end
+   local view=workspace.CurrentCamera.ViewportSize;local x,y=view.X*.5,view.Y*.5
+   local ok,err=pcall(function()input:SendMouseButtonEvent(x,y,0,true,game,0);task.wait(.05);input:SendMouseButtonEvent(x,y,0,false,game,0)end)
+   if set then set(previous)end
+   if not ok then error(err)end
+  end
+  if os.clock()-attackedAt>8 then skipped[target]=os.clock()+20;target=nil;status='Checking next pumpkin'end
+ end
+ preferences.Halloween={SetEnabled=start,Stop=stop,Snapshot=function()return {enabled=enabled,status=status}end}
+ local previousStop=preferences.StopAll;preferences.StopAll=function(...)stop();return previousStop(...)end
+ local previousCleanup=beforeCleanup;beforeCleanup=function()stop();if previousCleanup then previousCleanup()end end
+ task.spawn(function()
+  local identity=setthreadidentity or setidentity;if identity then identity(2)end
+  while alive do
+   if enabled then local ok,e=pcall(step);if not ok then status='Halloween retry: '..tostring(e);target=nil;task.wait(.5)end end
+   task.wait(enabled and .1 or .4)
+  end
+ end)
+end)()
+
+-- CDK follows the game's scroll progress; a death is not a completion signal.
+;(function()
+ local panel=panels['Get Items'];local rs=game.ReplicatedStorage;local remote=rs.Remotes.CommF_
+ label(panel,'Auto CDK Quest',18,690,370,28,13)
+ local button=control(panel,'OFF',410,690,80,28)
+ local status=label(panel,'',18,728,475,92,11);status.TextWrapped=true
+ panel.CanvasSize=UDim2.fromOffset(0,832)
+ local hazeWait={};local hazeSkip={}
+ local function groundPoint(pos)
+  local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include;params.FilterDescendantsInstances={workspace.Map,workspace.Terrain};params.RespectCanCollide=true
+  local hit=workspace:Raycast(pos+Vector3.new(0,12,0),Vector3.new(0,-180,0),params)
+  local c=player.Character;local h=c and c:FindFirstChildOfClass('Humanoid');local r=c and c:FindFirstChild('HumanoidRootPart')
+  return hit and hit.Position+Vector3.new(0,(h and h.HipHeight or 2)+(r and r.Size.Y/2 or 1),0)or pos
+ end
+ local streaming=false;local streamAt=0;local requestBusy=false;local token;local serial=0;local previous;local busy=false;local nextProgress=0;local progress
+ local inventoryCache;local inventoryAt=0;local mastery={};local lastEquip=0;local equipName
+ local waitingRaid=false;local lastRaidNotice=-math.huge;local lastTrialAt=-math.huge
+ local stageKey;local boatIndex=1;local boatsDone={};local torchSeen={};local waveWait=0
+ local lastAction=0;local cakeStarted;local waitTeleport=0;local lastKen=0;local failures=0
+ local haunt=Vector3.new(-9514.07,142.14,5547)
+ local crypt=Vector3.new(-12295,600,-6530)
+ local castle=Vector3.new(-5004.12,314.56,-3002.59)
+ local cake=Vector3.new(-821,66,-10965)
+ local docks={Vector3.new(-331.33,20.65,5528.43),Vector3.new(2183.1,21.76,-6621.52),Vector3.new(-10745.15,331.8,-8556.58)}
+ local boneNames={['Reborn Skeleton']=true,['Living Zombie']=true,['Demonic Soul']=true,['Posessed Mummy']=true,['Possessed Mummy']=true}
+ local function nameOf(s)return (tostring(s):gsub('%s*%[.*%]','')) end
+ local function say(s)status.Text=s;preferences.cdkStatus=s end
+ local function active(id)return alive and preferences.autoCDK==true and id==serial end
+ local function body()
+  local c=player.Character;local h=c and c:FindFirstChildOfClass('Humanoid');local root=c and c:FindFirstChild('HumanoidRootPart')
+  if h and h.Health>0 and root then return h,root end
+ end
+ local function point(o)
+  if not o then return end
+  if o:IsA('BasePart')then return o.Position end
+  if o:IsA('Attachment')then return o.WorldPosition end
+  if o:IsA('Model')then return o:GetPivot().Position end
+ end
+ local function tool(name)
+  for _,bag in pairs({player.Character,player:FindFirstChild('Backpack')})do
+   local t=bag:FindFirstChild(name);if t and t:IsA('Tool')then return t end
+  end
+ end
+ local function inventory()
+  if inventoryCache and os.clock()<inventoryAt then return inventoryCache end
+  local rep=require(rs.ItemReplicationService);local cfg=require(rs.ItemConfig)
+  if not rep.IsInitialized then return nil end
+  local items={};local levels={}
+  for _,v in pairs(rep:GetItems(rep.KEYS.MASTERY)or{})do levels[v.ItemId]=tonumber(v.Value)end
+  for _,v in pairs(rep:GetItems(rep.KEYS.QUANTITY)or{})do
+   if type(v.Value)=='number' and v.Value>0 then
+    local result=cfg.match(v.ItemId)
+    if result:isOk()then local c=result:unwrap();local n=c.Index and c.Index.StorageKey
+     if n=='Yama' or n=='Tushita' or n=='Cursed Dual Katana'then items[n]={item=v,config=c,mastery=levels[v.ItemId]}end
+    end
+   end
+  end
+  inventoryCache=items;inventoryAt=os.clock()+3;return items
+ end
+ local function request(id,fn)
+  if requestBusy or not active(id)then return end
+  requestBusy=true;local done=false;local ok,result
+  task.spawn(function()ok,result=pcall(fn);done=true;requestBusy=false end)
+  local deadline=os.clock()+8
+  repeat task.wait(.05)until done or not active(id)or os.clock()>=deadline
+  if not active(id)or not done then return end
+  if not ok then error(result,0)end
+  return result
+ end
+ local function call(id,...)
+  local args=table.pack(...)
+  return request(id,function()return remote:InvokeServer(table.unpack(args,1,args.n))end)
+ end
+ local function equip(name,id)
+  local t=tool(name);local h=body()
+  if t then
+   local lev=t:FindFirstChild('Level');if lev then mastery[name]=lev.Value end
+   if h and t.Parent~=player.Character then h:EquipTool(t)end
+   farm.SetWeapon('Sword');farm.serviceTool=name;return t
+  end
+  if os.clock()-lastEquip<2 then return end
+  local items=inventory();local entry=items and items[name];if not entry then return end
+  lastEquip=os.clock();equipName=name
+  local actions=entry.config.Inventory and entry.config.Inventory.Actions or{}
+  local modern=false;for _,a in pairs(actions)do if a=='EquipItem'then modern=true;break end end
+  if modern then request(id,function()return require(rs.Controllers.UI.Inventory.RemoteUtil).invokeAction('EquipItem',entry.item.ItemId,entry.item.NetworkedUID,false):await()end)
+  else call(id,'LoadItem',name)end
+  if not active(id)then return end
+  return tool(name)
+ end
+ local function claim()
+  if token and farm.SeaActive(token)then return true end
+  if preferences.itemQuestBusy and not previous or preferences.styleJob or preferences.autoSaber or preferences.autoSoulGuitar then say('Waiting for the current item quest to stop');return false end
+  if not previous then previous={weapon=farm.weapon,serviceTool=farm.serviceTool,mode=farm.mode,enabled=farm.enabled,stackFruit=farm.stackFruit,autoClick=farm.autoClick}end
+  preferences.itemQuestBusy=true;farm.stackSuspended=true;otherFarm.PausePriority()
+  sea.SetEnabled(false);travelAPI.Stop();if preferences.CancelAllHop then preferences.CancelAllHop()end
+  token=farm.SeaBegin();return true
+ end
+ local function release(resume)
+  local canResume=token and farm.SeaActive(token)
+  if token then farm.SeaEnd(token);token=nil end
+  preferences.cdkTakingDamage=false
+  if previous then
+   local old=previous;previous=nil;preferences.itemQuestBusy=false;farm.stackSuspended=false;otherFarm.ResumePriority()
+   farm.SetWeapon(old.weapon);farm.serviceTool=old.serviceTool
+   if resume and alive and canResume then farm.stackFruit=old.stackFruit;farm.SetAutoClick(old.autoClick);farm.SetMode(old.mode,old.enabled)end
+  end
+ end
+ local function stop(message,resume)
+  preferences.autoCDK=false;waitingRaid=false;serial=serial+1;release(resume);button.Text='OFF';say(message or 'Stopped');preferences.Flush()
+ end
+ local function setEnabled(on)
+  if not on then stop();return end
+  if game.PlaceId~=7449423635 and game.PlaceId~=100117331123089 then say('CDK requires Third Sea');return end
+  if preferences.autoCDK then return end
+  serial=serial+1;preferences.autoCDK=true;lastTrialAt=-math.huge;lastRaidNotice=-math.huge;nextProgress=0;inventoryAt=0;stageKey=nil;failures=0;say('Checking swords, mastery and saved CDK progress');preferences.Flush()
+ end
+ local function move(p,id,valid)
+  if not p or not active(id) or not token then return false end
+  local h,r=body();if not r then return false end
+  if h.Sit then h.Sit=false;h.Jump=true end
+  if (r.Position-p).Magnitude<7 then return true end
+  return farm.SeaMove(p,token,function()return active(id)and(not valid or valid())end)and active(id)
+ end
+ local function streamAround(position)
+  if not workspace.StreamingEnabled or streaming or os.clock()<streamAt then return end
+  streaming=true;streamAt=os.clock()+5
+  task.spawn(function()pcall(function()player:RequestStreamAroundAsync(position,3)end);streaming=false end)
+ end
+ local function raidEnemy(e)
+  local n=nameOf(e.Name):lower()
+  if e:GetAttribute('Boss')==true or e:GetAttribute('IsBoss')==true or n:find('boss',1,true)then return false end
+  local bosses={['rip_indra']=true,['rip_indra true form']=true,['diablo']=true,['deandre']=true,['urban']=true,['soul reaper']=true,['dough king']=true,['cake prince']=true,['cake queen']=true,['captain elephant']=true,['longma']=true}
+  return not bosses[n]
+ end
+ local function nearbyEnemy(filter,origin,maxDistance)
+  local folder=workspace:FindFirstChild('Enemies');local best,dist
+  for _,e in ipairs(folder and folder:GetChildren()or{})do
+   local h=e:FindFirstChildOfClass('Humanoid');local root=e:FindFirstChild('HumanoidRootPart')
+   if h and h.Health>0 and root and filter(e)then local d=(root.Position-origin).Magnitude
+    if d<(maxDistance or math.huge)and(not dist or d<dist)then best=e;dist=d end
+   end
+  end
+  return best
+ end
+ local function fight(e,id,sword,grounded)
+  if not equip(sword,id)then say('Equipping '..sword);return end
+  local h=e:FindFirstChildOfClass('Humanoid');local root=e:FindFirstChild('HumanoidRootPart');if not h or not root then return end
+  local function valid()return active(id)and e.Parent and h.Health>0 and body()~=nil end
+  if not move(grounded and (root.Position-root.CFrame.LookVector*4)or root.Position+Vector3.new(0,12,0),id,valid)then return end
+  if grounded then farm.SeaRelease(token)end
+  local untilTime=os.clock()+1
+  repeat
+   if not valid()then break end
+   if not grounded then farm.SeaHover(root,token,12,false)end;farm.SeaAttack(e,token);task.wait(.06)
+  until os.clock()>=untilTime
+ end
+ local function cursed()
+  local map=workspace:FindFirstChild('Map');local turtle=map and map:FindFirstChild('Turtle')
+  return turtle and turtle:FindFirstChild('Cursed')
+ end
+ local function prompt(o,id)
+  local pr=o and(o:IsA('ProximityPrompt')and o or o:FindFirstChildWhichIsA('ProximityPrompt',true))
+  local p=pr and point(pr.Parent)
+  if not pr or not pr.Enabled or not p then return false end
+  if move(p+Vector3.new(0,2,2),id)and active(id)then
+   if fireproximityprompt then fireproximityprompt(pr)else pr:InputHoldBegin();task.wait(pr.HoldDuration+.1);pr:InputHoldEnd()end
+   return true
+  end
+  return false
+ end
+ local function enter(part,id)
+  if not part or not part:IsA('BasePart')then return end
+  if move(part.Position,id)and active(id)then
+   farm.SeaRelease(token)
+   local _,root=body();if root and firetouchinterest then firetouchinterest(root,part,0);task.wait(.08);firetouchinterest(root,part,1)end
+  end
+ end
+ local function dimension()
+  local _,root=body();if not root then return end
+  for _,n in ipairs({'HeavenlyDimension','HellDimension'})do
+   local map=workspace.Map:FindFirstChild(n)
+   if map then local near=map:FindFirstChild('Exit',true)or map:FindFirstChildWhichIsA('BasePart',true)
+    if near and (root.Position-near.Position).Magnitude<1800 then return map end
+   end
+  end
+ end
+ local function runDimension(map,id,sword)
+  local _,root=body();local exit=map:FindFirstChild('Exit',true)
+  local enemy=nearbyEnemy(function()return true end,root.Position,1300)
+  if enemy then say(map.Name..': clearing torch enemies');fight(enemy,id,sword);waveWait=os.clock()+1;return end
+  if os.clock()<waveWait then return end
+  if exit and exit:IsA('BasePart')and exit:GetAttribute('ActiveColor')==exit.Color then
+   say('Trial cleared — entering the exit');enter(exit,id);nextProgress=0;return
+  end
+  local candidates={}
+  for _,o in ipairs(map:GetDescendants())do
+   if o:IsA('ProximityPrompt')and o.Enabled then
+    local node=o;local isTorch=false
+    while node and node~=map do if node.Name:lower():find('torch',1,true)then isTorch=true;break end;node=node.Parent end
+    if isTorch then candidates[#candidates+1]=o end
+   end
+  end
+  table.sort(candidates,function(a,b)return (point(a.Parent)-root.Position).Magnitude<(point(b.Parent)-root.Position).Magnitude end)
+  for _,pr in ipairs(candidates)do
+   if os.clock()>=(torchSeen[pr]or 0)then
+    say('Lighting next torch — then clearing its enemies')
+    if prompt(pr,id)then torchSeen[pr]=os.clock()+6;waveWait=os.clock()+2 end
+    return
+   end
+  end
+  say('Waiting for torch enemies or the trial exit to open')
+ end
+ local function takeDamage(e,id)
+  preferences.cdkTakingDamage=true
+  if not equip('Yama',id)then return end
+  if player:GetAttribute('KenActive')and os.clock()-lastKen>3 then
+   lastKen=os.clock();local input=game:GetService('VirtualInputManager');local setID=setthreadidentity or setidentity;local getID=getthreadidentity or getidentity;local oldID=getID and getID()or 2
+   pcall(function()if setID then setID(8)end;input:SendKeyEvent(true,Enum.KeyCode.E,false,game);task.wait(.08);input:SendKeyEvent(false,Enum.KeyCode.E,false,game)end)
+   if setID then setID(oldID)end
+  end
+  local p=e and e:FindFirstChild('HumanoidRootPart');if not p then return end
+  if move(p.Position+p.CFrame.LookVector*3,id)then farm.SeaRelease(token)end
+ end
+ local function refresh(id,side)
+  local result=call(id,'CDKQuest','Progress',side)
+  if type(result)=='table'and type(result.Good)=='number'and type(result.Evil)=='number'then progress=result;nextProgress=os.clock()+2;return true end
+  say('Waiting for CDK progress from the server');return false
+ end
+ local function step(id)
+  waitingRaid=false
+  if not body()then preferences.cdkTakingDamage=false;say('Waiting for respawn / trial teleport');nextProgress=0;return end
+  if not claim()then return end
+  local items=inventory();if not items then say('Waiting for inventory');return end
+  if items['Cursed Dual Katana']then stop('Cursed Dual Katana obtained',true);return end
+  for _,name in ipairs({'Tushita','Yama'})do
+   local t=tool(name);local lv=t and t:FindFirstChild('Level');local entry=items[name]
+   if not entry and not t then stop('Requires '..name..' — obtain the sword first');return end
+   local level=lv and lv.Value or entry and entry.mastery or mastery[name]
+   if not level then equip(name,id);say('Checking '..name..' mastery');return end
+   mastery[name]=level
+   if level<350 then
+    say(name..' mastery '..level..'/350 — farming bone enemies')
+    local e=nearbyEnemy(function(v)return boneNames[nameOf(v.Name)]end,haunt,1600)
+    if e then fight(e,id,name)else move(haunt+Vector3.new(0,18,0),id)end
+    inventoryAt=0;return
+   end
+  end
+  if player.Data.Level.Value<2200 then stop('Both swords ready; CDK requires level 2200');return end
+  local map=dimension()
+  if map then preferences.cdkTakingDamage=false;waitTeleport=0;runDimension(map,id,map.Name=='HellDimension'and'Yama'or'Tushita');return end
+  if os.clock()<waitTeleport then say('Waiting for the game to teleport into the trial');return end
+  if os.clock()>=nextProgress and not refresh(id)then return end
+  if not progress then return end
+  if progress.Finished then stop('CDK quest complete',true);return end
+  if progress.Opened==false then
+   say('Opening the CDK scroll room from afar')
+   if os.clock()-lastTrialAt>=2 then lastTrialAt=os.clock();call(id,'CDKQuest','OpenDoor',true);refresh(id)end
+   return
+  end
+  -- A blank (-2) scroll is locked while the other scroll's trial is active.
+  local side
+  if progress.Good<=-3 then side='Good'
+  elseif progress.Evil<=-3 then side='Evil'
+  elseif progress.Good>=0 and progress.Good<4 then side='Good'
+  elseif progress.Evil>=0 and progress.Evil<4 then side='Evil'
+  else side=progress.Good<4 and 'Good' or 'Evil' end
+  local value=progress[side];local sword=side=='Good'and'Tushita'or'Yama'
+  if progress.Good>=4 and progress.Evil>=4 then
+   preferences.cdkTakingDamage=false
+   local e=nearbyEnemy(function(v)return nameOf(v.Name)=='Cursed Skeleton Boss'or nameOf(v.Name)=='Cursed Skeleton'end,crypt,2500)
+   if e then say('Defeating the CDK boss with Tushita');fight(e,id,'Tushita');inventoryAt=0;return end
+   local c=cursed();if not c then move(crypt,id);return end
+   say('Combining six fragments and opening the boss door')
+   if os.clock()-lastAction>4 then
+    lastAction=os.clock();if move(point(c:FindFirstChild('Pedestal3'))or crypt,id)then call(id,'CDKQuest','StartTrial','Boss')end
+    local entrance=c:FindFirstChild('EntranceTouch');if entrance then enter(entrance,id);call(id,'CDKQuest','SpawnBoss')end
+   end
+   nextProgress=0;return
+  end
+  if value==-1 then stop(sword..' scroll requirements not met');return end
+  if value==-2 then say('Waiting for '..sword..' scroll to become available');return end
+  if value>=0 then
+   preferences.cdkTakingDamage=false
+   if not equip(sword,id)then say('Equipping '..sword);return end
+   if os.clock()-lastTrialAt<2 then return end
+   lastTrialAt=os.clock()
+   if value>=3 then say('Completing '..sword..' scroll from afar');refresh(id,side)
+   else
+    say('Accepting '..sword..' trial '..(value+1)..' from afar')
+    call(id,'CDKQuest','StartTrial',side)
+    if refresh(id) and progress[side]==value then say('Server has not accepted the trial yet — retrying from here') end
+   end
+   return
+  end
+  local trial=-value-2;local key=side..trial
+  if key~=stageKey then stageKey=key;boatsDone={};boatIndex=1;torchSeen={};cakeStarted=nil;waitTeleport=0 end
+  preferences.cdkTakingDamage=side=='Evil'and(trial==1 or trial==3)
+  if side=='Good'and trial==1 then
+   say('Docks Legend — talking to three boat dealers')
+   if boatIndex>3 then boatIndex=1;boatsDone={}end
+   local dest=docks[boatIndex];if not move(dest,id)then return end
+   local best,dist
+   for _,npc in ipairs(workspace.NPCs:GetChildren())do local p=point(npc)
+    if npc.Name:match('Boat Dealer$')and p and not boatsDone[npc]then local d=(p-dest).Magnitude;if d<2200 and(not dist or d<dist)then best=npc;dist=d end end
+   end
+   if best and move(point(best)+Vector3.new(0,0,4),id)then
+    if call(id,'CDKQuest','BoatQuest',best,'Check')then call(id,'CDKQuest','BoatQuest',best)end
+    boatsDone[best]=true;boatIndex=boatIndex+1;nextProgress=0
+   else say('Waiting for this island’s Boat Dealer to load')end
+  elseif side=='Good'and trial==2 then
+   say('Sense of Duty — waiting for Pirate Raid at Castle on the Sea')
+   local e=nearbyEnemy(raidEnemy,castle,1200)
+   if e then say('Sense of Duty — clearing Pirate Raid');fight(e,id,'Tushita')
+   else
+    local target=castle;streamAround(target)
+    if move(target,id,function()return not nearbyEnemy(raidEnemy,castle,1200)end)then
+     farm.SeaRelease(token);waitingRaid=true
+    end
+   end
+  elseif side=='Good'and trial==3 then
+   local e=nearbyEnemy(function(v)return nameOf(v.Name)=='Cake Queen'end,cake,2500)
+   if e then
+    if not cakeStarted then cakeStarted=os.clock()end
+    say('Soulless — Cake Queen '..math.max(0,120-math.floor(os.clock()-cakeStarted))..'s remaining')
+    fight(e,id,'Tushita')
+    local eh=e:FindFirstChildOfClass('Humanoid');if not e.Parent or eh and eh.Health<=0 then waitTeleport=os.clock()+12;nextProgress=0 end
+   else
+    if cakeStarted then waitTeleport=os.clock()+8;cakeStarted=nil;nextProgress=0
+    else say('Soulless — waiting for Cake Queen');move(cake+Vector3.new(0,25,0),id)end
+   end
+  elseif side=='Evil'and trial==1 then
+   say('Pain and Suffering — holding Yama and taking enemy damage')
+   local e=nearbyEnemy(function(v)return boneNames[nameOf(v.Name)]end,haunt,1600)
+   if e then takeDamage(e,id)else move(haunt,id)end
+  elseif side=='Evil'and trial==2 then
+   local haze=player:FindFirstChild('QuestHaze');if not haze then say('Waiting for marked-enemy quest data');nextProgress=0;return end
+   local _,root=body();local target,distance;local loadedTarget,loadedEnemy,loadedDistance
+   for _,v in ipairs(haze:GetChildren())do
+    if v:IsA('ValueBase')and tonumber(v.Value)and v.Value>0 then
+     local p=v:GetAttribute('Position');if typeof(p)=='CFrame'then p=p.Position end
+     if typeof(p)=='Vector3' then
+      local e=nearbyEnemy(function(n)return nameOf(n.Name)==v.Name end,root.Position,2500)
+      if e then local er=e:FindFirstChild('HumanoidRootPart');local d=(er.Position-root.Position).Magnitude;if not loadedDistance or d<loadedDistance then loadedTarget=v;loadedEnemy=e;loadedDistance=d end end
+      local d=(root.Position-p).Magnitude;if os.clock()>=(hazeSkip[v.Name]or 0)and(not distance or d<distance)then target=v;distance=d end
+     end
+    end
+   end
+   local pending=hazeWait.name and haze:FindFirstChild(hazeWait.name)
+   if pending and pending:IsA('ValueBase')and tonumber(pending.Value)and pending.Value>0 and os.clock()>=(hazeSkip[pending.Name]or 0)then target=pending end
+   if loadedTarget then target=loadedTarget end
+   if target then
+    say('Haze of Misery — '..target.Name..' ('..tostring(target.Value)..' left)')
+    local pos=target:GetAttribute('Position');if typeof(pos)=='CFrame'then pos=pos.Position end
+    local e=nearbyEnemy(function(v)return v.Name:sub(1,#target.Name)==target.Name end,pos,2500)
+    if e then
+     hazeWait={};local deadline=os.clock()+8
+     repeat
+      fight(e,id,'Yama')
+      if not active(id)or not body()then break end
+      local _,r=body()
+      e=nearbyEnemy(function(v)local q=haze:FindFirstChild(nameOf(v.Name));return q and q:IsA('ValueBase')and tonumber(q.Value)and q.Value>0 end,r.Position,2500)
+     until not e or os.clock()>=deadline
+    else
+     streamAround(pos)
+     local landing=groundPoint(pos)
+     if hazeWait.name~=target.Name then hazeWait={name=target.Name}end
+     local _,r=body()
+     local horizontal=r and Vector3.new(r.Position.X-pos.X,0,r.Position.Z-pos.Z).Magnitude or math.huge
+     if not hazeWait.arrived or horizontal>65 then
+      if move(landing,id,function()return not nearbyEnemy(function(v)return v.Name:sub(1,#target.Name)==target.Name end,pos,2500)end)then
+       farm.SeaRelease(token);hazeWait.arrived=os.clock()
+      end
+     else
+      farm.SeaRelease(token)
+      if os.clock()-hazeWait.arrived>=4 then hazeSkip[target.Name]=os.clock()+30;hazeWait={};say('Checking another required enemy spawn');return end
+     end
+     say('Haze of Misery — waiting for '..target.Name..' to spawn/load')
+    end
+   else say('Checking completion of marked enemies');nextProgress=0 end
+  elseif side=='Evil'and trial==3 then
+   say('Fear the Reaper — waiting for Soul Reaper; it must kill you')
+   local e=nearbyEnemy(function(v)return nameOf(v.Name)=='Soul Reaper'end,haunt,2500)
+   if e then takeDamage(e,id)
+   elseif tool('Hallow Essence')then
+    local map=workspace.Map:FindFirstChild('HauntedCastle')or workspace.Map:FindFirstChild('Haunted Castle')
+    local altar=map and(map:FindFirstChild('Summoner',true)or map:FindFirstChild('SoulReaperSummoner',true))
+    local touchPart=altar and(altar:FindFirstChild('Detection',true)or altar:FindFirstChildWhichIsA('BasePart',true))
+    local h=body();if touchPart and h then h:EquipTool(tool('Hallow Essence'));enter(touchPart,id)else move(haunt,id)end
+   else move(haunt+Vector3.new(0,12,0),id)end
+  else say('Unknown CDK stage; waiting for a valid server update');nextProgress=0 end
+ end
+ -- One short notification every six seconds, only while waiting at the castle.
+ task.spawn(function()
+  while alive do
+   if preferences.autoCDK and waitingRaid and token and farm.SeaActive(token) then
+    local _,root=body()
+    if root and (root.Position-castle).Magnitude<45 and os.clock()-lastRaidNotice>=6 then
+     lastRaidNotice=os.clock()
+     pcall(function()game:GetService('StarterGui'):SetCore('SendNotification',{Title='NEXO · CDK',Text='Waiting for Pirate Raid at Castle on the Sea',Duration=2.8})end)
+    end
+   end
+   task.wait(.1)
+  end
+ end)
+ preferences.CDK={Start=function()setEnabled(true)end,Stop=function()stop()end,SetEnabled=setEnabled,Snapshot=function()return {enabled=preferences.autoCDK==true,progress=progress,mastery=table.clone(mastery),status=status.Text}end}
+ bindControl(button,'Activated',function()setEnabled(not preferences.autoCDK)end)
+ connect(player.CharacterAdded,function()cakeStarted=nil;nextProgress=0;waitTeleport=os.clock()+3;torchSeen={}end)
+ local cleanup=beforeCleanup;beforeCleanup=function()preferences.autoCDK=false;serial=serial+1;release(false);if cleanup then cleanup()end end
+ task.spawn(function()
+  local setID=setthreadidentity or setidentity;if setID then setID(2)end
+  while alive do
+   button.Text=preferences.autoCDK and'ON'or'OFF'
+   if preferenceReady and preferences.autoCDK and not busy then
+    if game.PlaceId~=7449423635 and game.PlaceId~=100117331123089 then stop('CDK requires Third Sea')
+    elseif token and not farm.SeaActive(token)and body()then stop('CDK stopped: another task took control')
+    else
+     busy=true;local id=serial;local ok,err=pcall(step,id);busy=false
+     if not ok and active(id)then failures=failures+1;say('CDK retry: '..tostring(err));if failures>=3 then stop('CDK paused after repeated errors: '..tostring(err))else task.wait(1)end
+     elseif ok then failures=0 end
+    end
+   end
+   task.wait(.15)
+  end
+ end)
+end)()
+
 -- Prehistoric Island uses the existing boat search and skill scheduler.
 do
  local function installVolcano()
  local panel=panels['Sea Event'];local enabled=false;local token;local serial=0;local pending=false
+ local collectBones=false;local collectEggs=false;local collectOnly=false;local rewardScanAt=0;local rewardAttempts={};local rewardQuietAt;local rewardPhase=false
  local finding=false;local entered=false;local cast={};local lastPrompt=0;local savedWeapon;local savedTool
- local crackJob={};local golemWeapon='Gun';local crackTools={Fruit=true,Gun=true,Sword=true,Melee=true}
+ local crackJob={};local golemWeapon='Melee';local crackTools={Gun=true,Sword=true,Melee=true}
  line(panel,874);label(panel,'Volcano',16,882,480,28,15)
  local function row(text,y) label(panel,text,16,y,224,28,12);return control(panel,'OFF',244,y,252,28) end
  local findToggle=row('Find Prehistoric Island',916)
  local toggle=row('Auto Volcano Event',950)
  local weaponChoice=row('Golem weapon',984)
  local skillChoice=row('Crack skill tools',1018)
- local status=label(panel,'Off',16,1056,480,66,11);status.TextWrapped=true
- panel.CanvasSize=UDim2.fromOffset(0,1134)
+ local bonesToggle=row('Auto Collect Bones',1052)
+ local eggsToggle=row('Auto Collect Eggs',1086)
+ local status=label(panel,'Off',16,1124,480,66,11);status.TextWrapped=true
+ panel.CanvasSize=UDim2.fromOffset(0,1202)
  local function paint()
+  bonesToggle.Text=collectBones and 'ON' or 'OFF';eggsToggle.Text=collectEggs and 'ON' or 'OFF'
   toggle.Text=enabled and 'ON' or 'OFF';findToggle.Text=finding and 'ON' or 'OFF'
   weaponChoice.Text=golemWeapon..'  ▾'
   local list={};for _,kind in ipairs({'Fruit','Gun','Sword','Melee'}) do if crackTools[kind] then list[#list+1]=kind end end
@@ -8529,6 +9177,37 @@ do
  local function island()
   local map=workspace:FindFirstChild('Map');return map and map:FindFirstChild('PrehistoricIsland')
  end
+ -- Local contact protection only for this island's native lava hazards.
+ local lavaContacts={};local lavaScene;local lavaAdded
+ local function restoreLavaContacts()
+  if lavaAdded then lavaAdded:Disconnect();lavaAdded=nil end
+  for part,original in pairs(lavaContacts)do pcall(function()part.CanTouch=original end)end
+  lavaContacts={};lavaScene=nil
+ end
+ local function suppressLavaContact(object)
+  local part=object:IsA('TouchTransmitter')and object.Parent or object
+  if not lavaScene or not part or not part:IsA('BasePart')or not part:IsDescendantOf(lavaScene)then return end
+  if part:GetAttribute('__LavaPart')~=true and part.Name~='Lava'and not part:FindFirstAncestor('InteriorLava')then return end
+  if lavaContacts[part]==nil then lavaContacts[part]=part.CanTouch end
+  if part.CanTouch then part.CanTouch=false end
+ end
+ local function updateLavaContacts()
+  local map=island()
+  if map~=lavaScene then
+   restoreLavaContacts();lavaScene=map
+   if map then
+    for _,object in ipairs(map:GetDescendants())do suppressLavaContact(object)end
+    lavaAdded=map.DescendantAdded:Connect(suppressLavaContact)
+   end
+  end
+  for part in pairs(lavaContacts)do if part.Parent and part.CanTouch then part.CanTouch=false end end
+ end
+ preferences.VolcanoLavaProtectionSnapshot=function()
+  local count=0;for part in pairs(lavaContacts)do if part.Parent then count=count+1 end end
+  return {island=lavaScene~=nil,protectedParts=count,version=2,trackedStrongly=true}
+ end
+ updateLavaContacts()
+ task.spawn(function()while alive do updateLavaContacts();task.wait(.5)end;restoreLavaContacts()end)
  local function relic(map)
   local core=map:FindFirstChild('Core');local actual=core and core:FindFirstChild('PrehistoricRelic')
   if actual and point(actual) then return actual end
@@ -8560,11 +9239,11 @@ do
   otherFarm.ResumePriority()
  end
  local function stop(message)
-  enabled=false;crackJob={};serial=serial+1;toggle.Text='OFF';release()
+  enabled=false;collectOnly=false;crackJob={};serial=serial+1;toggle.Text='OFF';release()
   status.Text=message or 'Off'
   getgenv().NexoVolcanoLastStop={reason=status.Text,weapon=golemWeapon,time=os.time()}
  end
- local function active(id) return alive and enabled and serial==id and token and farm.SeaActive(token) end
+ local function active(id) return alive and (enabled or collectOnly) and serial==id and token and farm.SeaActive(token) end
  local oldFound=sea.OnIslandFound
  sea.OnIslandFound=function(name,ok)
   if oldFound then oldFound(name,ok) end
@@ -8581,9 +9260,11 @@ do
  end
  local function start()
   if not finding and not prepare() then return end
-  serial=serial+1;enabled=true;entered=false;crackJob={};cast={categories=crackTools};paint()
+  serial=serial+1;enabled=true;collectOnly=false;rewardPhase=false;rewardQuietAt=nil;rewardAttempts={};entered=false;crackJob={};cast={categories=crackTools,order={'Melee','Sword','Fruit','Gun'}};paint()
   status.Text=island() and 'Approaching Fossil Relic' or 'Waiting for island — enable Find Island to search'
  end
+ bindControl(bonesToggle,'Activated',function() collectBones=not collectBones;rewardAttempts={};rewardQuietAt=nil;paint() end)
+ bindControl(eggsToggle,'Activated',function() collectEggs=not collectEggs;rewardAttempts={};rewardQuietAt=nil;paint() end)
  bindControl(toggle,'Activated',function() if enabled then stop() else start() end end)
  bindControl(findToggle,'Activated',function()
   if finding then finding=false;if sea.searchIsland=='Prehistoric Island' then sea.SetIslandSearch(nil) end;paint();return end
@@ -8647,67 +9328,124 @@ do
   end
   return best
  end
- -- Short flank approach: no full perimeter tour or separate vertical legs.
+ -- Direct movement to an outside casting position; no lava-detour waypoints.
  local function volcanoRoute(target,map,keepMoving)
-  local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
-  if not root or not keepMoving() then return false end
-  local core=map:FindFirstChild('Core');local rocks=core and core:FindFirstChild('VolcanoRocks')
-  local center=Vector3.zero;local count=0
-  if rocks then for _,rock in ipairs(rocks:GetChildren()) do
-   local part=rock:FindFirstChild('volcanorock')
-   if part and part:IsA('BasePart') then center=center+part.Position;count=count+1 end
-  end end
-  if count==0 then return false end
-  center=center/count
-  local from=root.Position
-  local a=(from-center)*Vector3.new(1,0,1);local b=(target-center)*Vector3.new(1,0,1)
-  if a.Magnitude>1 and b.Magnitude>1 then
-   local first=math.atan2(a.Z,a.X);local last=math.atan2(b.Z,b.X)
-   local turn=(last-first+math.pi)%(2*math.pi)-math.pi
-   -- Only add flank waypoints when switching to a different side of the volcano.
-   if math.abs(turn)>math.rad(65) then
-    local segments=math.ceil(math.abs(turn)/math.rad(65))
-    local radius=math.max(math.min(a.Magnitude,b.Magnitude+40),b.Magnitude)+12
-    for i=1,segments-1 do
-     if not keepMoving() then return false end
-     local fraction=i/segments;local angle=first+turn*fraction
-     local waypoint=Vector3.new(center.X+math.cos(angle)*radius,from.Y+(target.Y-from.Y)*fraction,center.Z+math.sin(angle)*radius)
-     if not farm.SeaMove(waypoint,token,keepMoving) then return false end
-    end
-   end
-  end
-  return keepMoving() and farm.SeaMove(target,token,keepMoving)
+  return keepMoving() and farm.VolcanoMove(target,token,keepMoving)
  end
  local function holdCurrent(id)
   if not active(id) then return end
   local c=player.Character;local root=c and c:FindFirstChild('HumanoidRootPart');local h=c and c:FindFirstChildOfClass('Humanoid')
-  if root and h and h.Health>0 then farm.SeaHold(root.Position,token);root.AssemblyLinearVelocity=Vector3.zero end
+  if root and h and h.Health>0 then farm.VolcanoHold(root.Position,token);root.AssemblyLinearVelocity=Vector3.zero end
  end
  local function moveToCrack(target,id,map,part)
   if not active(id) then return false end
   if golem(map) or not crackActive(part) then holdCurrent(id);return false end
   local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
   if not root then return false end
-  if (root.Position-target).Magnitude<8 then farm.SeaHold(target,token,part.Position);return true end
+  if (root.Position-target).Magnitude<8 then farm.VolcanoHold(target,token,part.Position);return true end
   local arrived=volcanoRoute(target,map,function() return active(id) and not golem(map) and crackActive(part) end)
-  if arrived and active(id) and not golem(map) and crackActive(part) then farm.SeaHold(target,token,part.Position);return true end
+  if arrived and active(id) and not golem(map) and crackActive(part) then farm.VolcanoHold(target,token,part.Position);return true end
   holdCurrent(id)
   status.Text=golem(map) and 'Switching to Lava Golem' or not crackActive(part) and 'Crack closed; selecting next target' or 'Crack approach interrupted; retrying'
   return false
+ end
+ local function rewardKind(object,map)
+  local core=map:FindFirstChild('Core')
+  local eggs=core and core:FindFirstChild('SpawnedDragonEggs')
+  if eggs and object:IsDescendantOf(eggs) then return 'egg' end
+  local node=object
+  while node and node~=map do
+   local n=norm(node.Name)
+   if n=='dragonegg' or n=='prehistoricislanddragonegg' then return 'egg' end
+   if n=='bone' or n=='bones' or n=='dinosaurbone' or n=='dinosaurbones' then return 'bone' end
+   node=node.Parent
+  end
+ end
+ local function rewardCandidates(map)
+  local result={};local seen={}
+  local function consider(o,kind)
+   local isPrompt=o:IsA('ProximityPrompt') and o.Enabled
+   local isTouch=o:IsA('TouchTransmitter')
+   if not isPrompt and not isTouch then return end
+   kind=kind or rewardKind(o,map)
+   if not (kind=='egg' and collectEggs or kind=='bone' and collectBones) then return end
+   local anchor=o.Parent;local position=anchor and point(anchor)
+   if position and not seen[anchor] then
+    seen[anchor]=true;result[#result+1]={object=o,anchor=anchor,position=position,kind=kind,prompt=isPrompt}
+   end
+  end
+  for _,o in ipairs(map:GetDescendants()) do consider(o) end
+  -- The live game's Dinosaur Bone pickups are direct Workspace children, not island descendants.
+  local core=map:FindFirstChild('Core');local spawn=core and core:FindFirstChild('DragonEggSpawn')
+  local origin=spawn and point(spawn)
+  if collectBones and origin then for _,o in ipairs(workspace:GetChildren()) do
+   if o.Name=='DinoBone' and o:IsA('BasePart') and (o.Position-origin).Magnitude<2500 then
+    local touch=o:FindFirstChildWhichIsA('TouchTransmitter')
+    if touch then consider(touch,'bone') end
+   end
+  end end
+  return result
+ end
+ local function collectRewards(id,map)
+  local now=os.clock();rewardQuietAt=rewardQuietAt or now
+  local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+  if not root then return end
+  local candidates=rewardCandidates(map);local best,distance;local waiting=false
+  for _,entry in ipairs(candidates) do
+   local attempt=rewardAttempts[entry.object]
+   if not attempt or attempt.count<3 then
+    waiting=true
+    if not attempt or now>=attempt.nextAt then
+     local d=(root.Position-entry.position).Magnitude
+     if not distance or d<distance then best=entry;distance=d end
+    end
+   end
+  end
+  if best then
+   rewardQuietAt=now
+   status.Text=best.kind=='egg' and 'Collecting Dragon Egg' or 'Collecting Dinosaur Bones'
+   local function valid() return active(id) and map.Parent~=nil and best.object.Parent~=nil and (best.kind=='egg' and collectEggs or best.kind=='bone' and collectBones) and map:GetAttribute('IsMinigameActive')~=true end
+   if farm.VolcanoMove(best.position+Vector3.new(0,2,0),token,valid) and valid() then
+    farm.VolcanoHold(best.position+Vector3.new(0,2,0),token)
+    local attempt=rewardAttempts[best.object] or {count=0};rewardAttempts[best.object]=attempt
+    attempt.count=attempt.count+1;attempt.nextAt=os.clock()+3
+    if best.prompt and best.object.Enabled then
+     -- Respect the real one-second egg hold rather than firing a zero-duration attempt.
+     if fireproximityprompt then fireproximityprompt(best.object,best.object.HoldDuration+.1)
+     else best.object:InputHoldBegin();task.wait(best.object.HoldDuration+.1);best.object:InputHoldEnd() end
+    elseif best.anchor:IsA('BasePart') and firetouchinterest then
+     firetouchinterest(root,best.anchor,0);task.wait(.05);firetouchinterest(root,best.anchor,1)
+    end
+   end
+  elseif waiting then
+   rewardQuietAt=now;status.Text='Waiting for reward pickup confirmation'
+  elseif now-rewardQuietAt>=15 then
+   stop(#candidates>0 and 'Reward sweep ended — remaining pickups unavailable' or 'Reward sweep finished')
+  else status.Text='Event ended — waiting for reward pickups to appear' end
  end
  local function step(id,map)
   local character=player.Character;local h=character and character:FindFirstChildOfClass('Humanoid')
   if not h or h.Health<=0 then stop('Auto Event stopped: character died');return end
   local participating=player:GetAttribute('PrehistoricIslandParticipant')
-  if participating then entered=true elseif entered and participating==false then stop('Event participation ended — check the game result');return end
-  local enemy=golem(map);local c=crack(map)
+  local eventActive=map:GetAttribute('IsMinigameActive')
+  if participating or eventActive==true then entered=true end
+  if entered and eventActive==false then
+   local r=relic(map);local health=r and r:FindFirstChild('Health')
+   if health and health.Value<=0 then stop('Event ended: relic destroyed');return end
+   if not rewardPhase then rewardPhase=true;crackJob={};farm.SeaRelease(token) end
+   collectRewards(id,map);return
+  end
+  if entered and participating==false then stop('Event participation ended — check the game result');return end
+  local enemy=golem(map)
+  if crackJob.part and not crackActive(crackJob.part) then crackJob={}end
+  local c=not enemy and crack(map)
   -- Activate before attacking. Existing active event objects also establish the event has started.
   if not entered and not enemy and not c then
    farm.SeaRelease(token);local r=relic(map)
    if not r then status.Text='Waiting for Fossil Relic to load';return end
    status.Text='Approaching Fossil Relic'
    local prompt,position=activation(map,r)
-   if farm.SeaMove(position+Vector3.new(0,2,2),token) and active(id) then
+   if farm.VolcanoMove(position+Vector3.new(0,2,2),token) and active(id) then
     if prompt and prompt.Enabled and os.clock()-lastPrompt>5 then
      lastPrompt=os.clock();status.Text='Activating Volcano Event'
      if fireproximityprompt then fireproximityprompt(prompt) else prompt:InputHoldBegin();task.wait(prompt.HoldDuration+.1);prompt:InputHoldEnd() end
@@ -8727,10 +9465,10 @@ do
    local root=character:FindFirstChild('HumanoidRootPart')
    local near=p and root and (root.Position-p.Position).Magnitude<22
    if p and (near or volcanoRoute(p.Position+Vector3.new(0,10,4),map,function() return active(id) and p.Parent~=nil and eh and eh.Parent and eh.Health>0 end)) and active(id) then
-    farm.SeaHover(p,token,18,false);local deadline=os.clock()+1
+    farm.VolcanoHold(p.Position+Vector3.new(0,18,0),token,p.Position);local deadline=os.clock()+1
     repeat
      if not enemy.Parent or not p.Parent or not eh or not eh.Parent or eh.Health<=0 then break end
-     farm.SeaAttack(enemy,token);task.wait(.06)
+     farm.VolcanoHold(p.Position+Vector3.new(0,18,0),token,p.Position);farm.SetSkillAim(p.Position,token,p);farm.SeaAttack(enemy,token);task.wait(.06)
     until not active(id) or not p.Parent or not eh.Parent or eh.Health<=0 or os.clock()>=deadline
 
    end
@@ -8741,36 +9479,25 @@ do
    local core=map:FindFirstChild('Core');local interior=core and core:FindFirstChild('InteriorLava');local top=interior and interior:FindFirstChild('Top')
    local origin=top and top.Position or map:GetPivot().Position
    local rocks=core and core:FindFirstChild('VolcanoRocks');local sum=Vector3.zero;local count=0
-   if rocks then for _,rock in ipairs(rocks:GetChildren()) do local part=rock:FindFirstChild('volcanorock');if part and part:IsA('BasePart') then sum=sum+part.Position;count=count+1 end end end
+   if rocks then for _,rock in ipairs(rocks:GetChildren())do local part=rock:FindFirstChild('volcanorock');if part and part:IsA('BasePart')then sum=sum+part.Position;count=count+1 end end end
    if count>0 then origin=sum/count end
-   local offset=Vector3.new(c.Position.X-origin.X,0,c.Position.Z-origin.Z)
-   if offset.Magnitude<1 then offset=Vector3.new(1,0,0) end
-   -- Stand outside the actual rotated rock bounds, not a fixed offset inside it.
-   local direction=offset.Unit
-   local localDirection=c.CFrame:VectorToObjectSpace(direction)
-   local half=c.Size*.5
-   local extent=math.huge
-   for _,axis in ipairs({'X','Y','Z'}) do
-    local component=math.abs(localDirection[axis])
-    if component>.001 then extent=math.min(extent,half[axis]/component) end
-   end
-   if crackJob.part~=c then crackJob={part=c,attempts=0,standOff=24,lastHealth=h.Health};cast={categories=crackTools} end
-   if crackJob.lastHealth and h.Health<crackJob.lastHealth-1 then crackJob.standOff=math.min(48,(crackJob.standOff or 24)+8) end
-   crackJob.lastHealth=h.Health
-   -- Raycast this rock alone to aim at its exposed mesh face instead of its center.
-   local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include;params.FilterDescendantsInstances={c}
-   local reach=c.Size.Magnitude+40
-   local hit=workspace:Raycast(c.Position+direction*reach,-direction*(reach+5),params)
-   local surface=hit and hit.Position or c.Position+direction*extent
-   local aimPoint=surface-direction*1.5
-   local target=surface+direction*(crackJob.standOff or 24)+Vector3.new(0,3,0)
+   -- The active rock's thinnest local axis is its cast face, even when tilted.
+   local axis,thickness
+   if c.Size.X<=c.Size.Y and c.Size.X<=c.Size.Z then axis=c.CFrame.RightVector;thickness=c.Size.X
+   elseif c.Size.Y<=c.Size.Z then axis=c.CFrame.UpVector;thickness=c.Size.Y
+   else axis=c.CFrame.LookVector;thickness=c.Size.Z end
+   local radial=Vector3.new(c.Position.X-origin.X,0,c.Position.Z-origin.Z)
+   if axis:Dot(radial)<0 then axis=-axis end
+   if math.abs(axis:Dot(radial))<.01 and axis.Y<0 then axis=-axis end
+   local aimPoint=c.Position
+   local target=c.Position+axis*math.max(40,thickness*.5+8)
+   if crackJob.part~=c then crackJob={part=c,attempts=0};cast={categories=crackTools,order={'Melee','Sword','Fruit','Gun'}}end
    -- One target, one cast, then confirmation. Do not restart travel during an animation.
    local busy=character:FindFirstChild('Busy')
-   if busy and busy.Value then farm.SeaHold(target,token,aimPoint);status.Text='Finishing skill outside crack';return end
+   if busy and busy.Value then holdCurrent(id);status.Text='Finishing current skill';return end
    if not moveToCrack(target,id,map,c) then return end
-   local castHealth=h.Health
    local function valid()
-    return active(id) and c.Parent~=nil and crackActive(c) and not golem(map) and h.Health>0 and h.Health>=castHealth-1
+    return active(id) and c.Parent~=nil and crackActive(c) and not golem(map) and h.Health>0
    end
    local settle=os.clock()+.25
    repeat task.wait(.05) until os.clock()>=settle or not valid()
@@ -8779,14 +9506,14 @@ do
    if not root or (root.Position-target).Magnitude>10 then status.Text='Aligning outside crack';return end
    status.Text='Aiming at crack'
    cast.categories=crackTools
-   cast.confirmSeconds=1.2
+   cast.confirmSeconds=.35
    local used,why=farm.CastSkillCycle(cast,function()
     if not valid() then return nil end
     return aimPoint
    end,token)
    if used then
     crackJob.attempts=crackJob.attempts+1
-    if not crackActive(c) then crackJob={};status.Text='Crack closed'
+    if not crackActive(c) then crackJob={};status.Text='Crack closed — checking next target'
     else status.Text='Crack still open — selecting next ready skill' end
     holdCurrent(id)
    else status.Text=why or 'Waiting for a ready selected skill' end
@@ -8796,7 +9523,7 @@ do
    if r and root then
     local safe=point(r)+Vector3.new(0,14,18)
     if (root.Position-safe).Magnitude<8 or volcanoRoute(safe,map,function() return active(id) and not golem(map) and not crack(map) end) then
-     if active(id) then farm.SeaHold(safe,token) end
+     if active(id) then farm.VolcanoHold(safe,token) end
     end
    end
    holdCurrent(id)
@@ -8804,8 +9531,10 @@ do
   end
  end
  local oldCleanup=beforeCleanup
- beforeCleanup=function() stop();if finding and sea.searchIsland=='Prehistoric Island' then sea.SetIslandSearch(nil) end;if oldCleanup then oldCleanup() end end
- preferences.Volcano={Snapshot=function()return {enabled=enabled,weapon=golemWeapon,tools=table.clone(crackTools)}end,Stop=stop,Start=start,Configure=function(weapon,tools)
+ beforeCleanup=function()restoreLavaContacts();stop();if finding and sea.searchIsland=='Prehistoric Island' then sea.SetIslandSearch(nil) end;if oldCleanup then oldCleanup() end end
+ preferences.Volcano={Snapshot=function() return {enabled=enabled,weapon=golemWeapon,tools=table.clone(crackTools),collectBones=collectBones,collectEggs=collectEggs,status=status.Text} end,
+ SetCollectBones=function(v) collectBones=v==true;rewardAttempts={};rewardQuietAt=nil;paint() end,SetCollectEggs=function(v) collectEggs=v==true;rewardAttempts={};rewardQuietAt=nil;paint() end,
+ Stop=function(message) collectBones=false;collectEggs=false;paint();stop(message) end,Start=start,Configure=function(weapon,tools)
   if weapon=='Gun' or weapon=='Melee' or weapon=='Sword' or weapon=='Fruit' then golemWeapon=weapon end
   if type(tools)=='table' then for _,k in ipairs({'Fruit','Gun','Sword','Melee'}) do crackTools[k]=tools[k]==true or nil end end
   paint()
@@ -8815,6 +9544,29 @@ do
   if setIdentity then setIdentity(2) end
   while alive do
    if finding and not sea.enabled then finding=false;paint() end
+   if not enabled and not pending then
+    local map=island()
+    if collectOnly and (not map or not (collectBones or collectEggs) or not token or not farm.SeaActive(token)) then
+     collectOnly=false;serial=serial+1;release();status.Text='Reward collection stopped'
+    end
+    if not collectOnly and (collectBones or collectEggs) and map and os.clock()>=rewardScanAt then
+     rewardScanAt=os.clock()+.5
+     local hr=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+     local found=false
+     for _,entry in ipairs(rewardCandidates(map)) do
+      local attempt=rewardAttempts[entry.object]
+      if hr and (hr.Position-entry.position).Magnitude<2500 and (not attempt or attempt.count<3) then found=true;break end
+     end
+     if found and map:GetAttribute('IsMinigameActive')~=true and prepare() then
+      sea.SetEnabled(false);otherFarm.PausePriority();savedWeapon=farm.weapon;savedTool=farm.serviceTool
+      token=farm.SeaBegin();serial=serial+1;collectOnly=true;rewardQuietAt=nil
+     end
+    end
+    if collectOnly and token then
+     local id=serial;pending=true;local ok,err=pcall(collectRewards,id,map);pending=false
+     if not ok then stop('Collection stopped: '..tostring(err)) end
+    end
+   end
    if enabled and not pending then
     if token and not farm.SeaActive(token) then stop('Stopped: another task took control')
     elseif finding or (sea.enabled and sea.searchIsland=='Prehistoric Island') then status.Text=sea.message
@@ -9105,8 +9857,9 @@ do
   local function run(fn,...)
    if type(fn)=='function' then local ok,err=pcall(fn,...);if not ok then errors[#errors+1]=tostring(err) end end
   end
-  for _,key in ipairs({'autoTrial','findFullMoon','v4Training','raceV2','raceV3','autoSpawnIndra','autoSpawnDoughKing','autoSpawnDarkbeard','autoRengoku','eliteHop','fruitHop'}) do preferences[key]=false end
+  for _,key in ipairs({'autoTrial','findFullMoon','v4Training','raceV2','raceV3','autoSpawnReaper','autoSpawnIndra','autoSpawnDoughKing','autoSpawnDarkbeard','autoRengoku','eliteHop','fruitHop'}) do preferences[key]=false end
   if preferences.other then preferences.other.haki=false;preferences.other.hakiHop=false end
+  if preferences.CDK then run(preferences.CDK.Stop) end
   if preferences.RaidFruit then run(preferences.RaidFruit.Stop) end
   if preferences.BlueGear then run(preferences.BlueGear.Stop) end
   run(preferences.CancelAllHop)
@@ -9262,7 +10015,7 @@ do
 end
 
 -- Optional visual helpers and emergency retreat; all start disabled.
-do
+;(function()
  local c={fruit=false,players=false,berry=false,islands=false,aimPlayer=false,observation=false,hideObservation=false,retreat=false,percent=30,height=800}
  preferences.helpers=c
  local y=734
@@ -9328,47 +10081,74 @@ do
   end
   b:FindFirstChildOfClass('TextLabel').Text=name..' | '..math.floor((p.Position-origin).Magnitude+.5)..' studs'
  end
- local function targets()
-  local list={}
-  if c.aimPlayer then for _,p in ipairs(game.Players:GetPlayers())do if p~=player and p.Character then list[#list+1]=p.Character end end end
-  return list
- end
- connect(game:GetService('RunService').RenderStepped,function()
-  aimPart=nil;aimPosition=nil
-  if retreating or not(c.aimPlayer)then return end
-  local char=player.Character;local root=char and char:FindFirstChild('HumanoidRootPart');local tool=char and char:FindFirstChildOfClass('Tool');local camera=workspace.CurrentCamera
-  if not root or not tool or not camera then return end
-  local best,dist
-  for _,v in ipairs(targets())do
-   local h=v:FindFirstChildOfClass('Humanoid');local p=anchor(v)
-   if h and h.Health>0 and p then local d=(p.Position-root.Position).Magnitude;if d<500 and (not dist or d<dist)then best=p;dist=d end end
-  end
-  aimPart=best;aimPosition=best and best.Position
-  if best then local pos=tool:FindFirstChild('MousePos');if pos and pos:IsA('Vector3Value')then pos.Value=best.Position end end
- end)
- -- One reusable hook; scope changes to the equipped tool and native gun shots.
- local aimEnv=getgenv()
- local aimOwner={}
+ -- Shared native aim: the moveset runner sends one Vector3/CFrame aim update
+ -- through the equipped weapon's RemoteEvent. Preserve every other argument.
+ local aimEnv=getgenv();local aimOwner={};local nativeMouse=require(game.ReplicatedStorage.Mouse)
+ local skillAim;local aimRemotes={};local currentAimTool;local aimSource;local sharedSaved
  aimEnv.NexoAimOwner=aimOwner
+ -- Retire the previous Mouse Instance hooks; their reusable wrappers now pass through.
+ aimEnv.NexoAimRead=nil;aimEnv.NexoAimWrite=nil;aimEnv.NexoAimMousePos=nil
  local shotRemote=game.ReplicatedStorage.Modules.Net:FindFirstChild('RE/ShootGunEvent')
- aimEnv.NexoAimRewrite=function(remote,args)
-  -- No Instance method calls here: they can change the pending namecall method.
-  if not alive or retreating or not aimPosition or not aimPart or not(c.aimPlayer)then return end
-  if remote==shotRemote and typeof(args[1])=='Vector3' then
-   args[1]=aimPosition
-   if type(args[2])=='table' then args[2]={aimPart} end
+ local function restoreMouse()
+  if sharedSaved then
+   if rawget(nativeMouse,'Hit')==sharedSaved.applied then rawset(nativeMouse,'Hit',sharedSaved.hit);rawset(nativeMouse,'Target',sharedSaved.target)end
+   sharedSaved=nil
   end
-  -- Skill arguments remain untouched. Supported tools aim through MousePos above.
  end
- if not aimEnv.NexoAimHookInstalled and type(hookmetamethod)=='function' and type(getnamecallmethod)=='function' and type(checkcaller)=='function' then
+ local function updateAim()
+  aimPart=nil;aimPosition=nil;aimSource=nil
+  local char=player.Character;local root=char and char:FindFirstChild('HumanoidRootPart');local tool=char and char:FindFirstChildOfClass('Tool')
+  if tool~=currentAimTool then
+   currentAimTool=tool;aimRemotes={}
+   if tool then for _,remote in ipairs(tool:GetDescendants())do
+    if remote:IsA('RemoteEvent')and(remote.Name=='RemoteEvent'or remote.Name=='LegacyRemoteEvent'or remote.Name=='MousePos'or remote.Name=='Mouse')then aimRemotes[remote]=true end
+   end end
+  end
+  if not alive or not root or not tool or retreating then restoreMouse();return end
+  if skillAim and skillAim.token==farm.generation and os.clock()<skillAim.untilTime then
+   aimPosition=skillAim.position;aimPart=skillAim.part;aimSource='Farm'
+  elseif c.aimPlayer then
+   local dist
+   for _,other in ipairs(game.Players:GetPlayers())do
+    local model=other~=player and other.Character;local h=model and model:FindFirstChildOfClass('Humanoid');local part=model and model:FindFirstChild('HumanoidRootPart')
+    if h and h.Health>0 and part then local d=(part.Position-root.Position).Magnitude;if d<500 and(not dist or d<dist)then aimPart=part;aimPosition=part.Position;dist=d end end
+   end
+   if aimPosition then aimSource='Player'end
+  end
+  if not aimPosition then restoreMouse();return end
+  local hit=CFrame.new(aimPosition)
+  if not sharedSaved then sharedSaved={hit=rawget(nativeMouse,'Hit'),target=rawget(nativeMouse,'Target')}end
+  sharedSaved.applied=hit;rawset(nativeMouse,'Hit',hit);rawset(nativeMouse,'Target',aimPart)
+  local pos=tool:FindFirstChild('MousePos')or tool:FindFirstChild('Mouse')
+  if pos then if pos:IsA('Vector3Value')then pos.Value=aimPosition elseif pos:IsA('CFrameValue')then pos.Value=hit end end
+ end
+ function farm.SetSkillAim(position,token,part)
+  if typeof(position)~='Vector3'or token~=farm.generation then return false end
+  skillAim={position=position,token=token,part=part,untilTime=os.clock()+.75};updateAim();return true
+ end
+ function farm.ClearSkillAim(token)
+  if skillAim and skillAim.token==token then skillAim.untilTime=math.min(skillAim.untilTime,os.clock()+.4)end
+ end
+ preferences.PlayerAimSnapshot=function()return {enabled=c.aimPlayer,target=aimPart and aimPart.Parent and aimPart.Parent.Name,position=aimPosition,source=aimSource,sharedMouse=true}end
+ connect(game:GetService('RunService').RenderStepped,updateAim)
+ aimEnv.NexoAimRewrite=function(remote,args)
+  -- This callback must not call Instance methods while a namecall is pending.
+  if not alive or retreating or not aimPosition then return end
+  if aimSource=='Farm'and(not skillAim or skillAim.token~=farm.generation or os.clock()>=skillAim.untilTime)then return end
+  if aimSource=='Player'and not c.aimPlayer then return end
+  if remote==shotRemote and typeof(args[1])=='Vector3'then
+   args[1]=aimPosition;if type(args[2])=='table'and aimPart then args[2]={aimPart}end
+  elseif aimRemotes[remote]and args.n==1 then
+   if typeof(args[1])=='Vector3' then args[1]=aimPosition
+   elseif typeof(args[1])=='CFrame'then args[1]=CFrame.new(aimPosition)*args[1].Rotation end
+  end
+ end
+ if not aimEnv.NexoAimHookInstalled and type(hookmetamethod)=='function'and type(getnamecallmethod)=='function'and type(checkcaller)=='function'and type(newcclosure)=='function'then
   local previous
   previous=hookmetamethod(game,'__namecall',newcclosure(function(remote,...)
-   local args=table.pack(...)
-   local method=getnamecallmethod()
-   if not checkcaller() and (method=='FireServer' or method=='InvokeServer') and aimEnv.NexoAimRewrite then
-    pcall(aimEnv.NexoAimRewrite,remote,args)
-   end
-   if type(setnamecallmethod)=='function' then setnamecallmethod(method) end
+   local args=table.pack(...);local method=getnamecallmethod()
+   if not checkcaller()and(method=='FireServer'or method=='InvokeServer')and aimEnv.NexoAimRewrite then pcall(aimEnv.NexoAimRewrite,remote,args)end
+   if type(setnamecallmethod)=='function'then setnamecallmethod(method)end
    return previous(remote,table.unpack(args,1,args.n))
   end))
   aimEnv.NexoAimHookInstalled=true
@@ -9386,7 +10166,7 @@ do
     if c.fruit then for _,v in ipairs(workspace:GetChildren())do if v.Name:lower():find('fruit',1,true)then mark(v,v.Name,'fruit',root.Position,seen)end end end
     if c.berry then local map=workspace:FindFirstChild('Map');if map then for _,v in ipairs(map:GetDescendants())do if v.Name:lower():find('bush',1,true)then for k,a in pairs(v:GetAttributes())do if type(a)=='string' and a:lower():find('berry',1,true)then mark(v,a,'berry',root.Position,seen);break end end end end end end
     for v,b in pairs(marks)do if not seen[v]then b:Destroy();marks[v]=nil end end
-    if c.observation and not observationPending and player:GetAttribute('KenActive')~=true and os.clock()-lastObservation>3 and not game:GetService('UserInputService'):GetFocusedTextBox() then
+    if c.observation and not preferences.cdkTakingDamage and not observationPending and player:GetAttribute('KenActive')~=true and os.clock()-lastObservation>3 and not game:GetService('UserInputService'):GetFocusedTextBox() then
      lastObservation=os.clock();observationPending=true
      task.spawn(function()
       local setID=setthreadidentity or setidentity;local getID=getthreadidentity or getidentity;local oldID=getID and getID() or 2
@@ -9402,7 +10182,7 @@ do
       if not ok then warn('Nexo observation: '..tostring(err))end
      end)
     end
-    if c.retreat and not retreating and h and h.Health>0 and h.Health/h.MaxHealth<=c.percent/100 then
+    if c.retreat and not preferences.cdkTakingDamage and not retreating and h and h.Health>0 and h.Health/h.MaxHealth<=c.percent/100 then
      local destination=root.Position+Vector3.new(0,c.height,0);retreating=true
      task.spawn(function()
       local ok,err=pcall(function()
@@ -9446,11 +10226,11 @@ do
  local previousStop=preferences.StopAll
  preferences.StopAll=function()
   for _,key in ipairs({'fruit','players','berry','islands','aimPlayer','observation','hideObservation','retreat'})do c[key]=false end
-  restoreObservation();clear();if retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil end
+  skillAim=nil;restoreMouse();restoreObservation();clear();if retreatToken then farm.SeaEnd(retreatToken);retreatToken=nil end
   return previousStop()
  end
- local previousCleanup=beforeCleanup;beforeCleanup=function()restoreObservation();if aimEnv.NexoAimOwner==aimOwner then aimEnv.NexoAimRewrite=nil;aimEnv.NexoAimOwner=nil end;clear();if retreatToken then farm.SeaEnd(retreatToken)end;if previousCleanup then previousCleanup()end end
-end
+ local previousCleanup=beforeCleanup;beforeCleanup=function()skillAim=nil;restoreMouse();restoreObservation();if aimEnv.NexoAimOwner==aimOwner then aimEnv.NexoAimRewrite=nil;aimEnv.NexoAimRead=nil;aimEnv.NexoAimWrite=nil;aimEnv.NexoAimMousePos=nil;aimEnv.NexoAimOwner=nil end;clear();if retreatToken then farm.SeaEnd(retreatToken)end;if previousCleanup then previousCleanup()end end
+end)()
 
 -- Friends share the boat roster; each account controls only its own character.
 do
@@ -10032,6 +10812,23 @@ local bridgeAudit={missing={},bindings={}}
 local function resolveBinding(section,spec,kind,occurrence,group)
  local n=spec.n;local key=section..' / '..tostring(n)..' / '..kind..' / '..tostring(occurrence or 1)
  local function done(b)bridgeAudit.bindings[key]=b;return b end
+ if section=='Stack Farm'and kind=='toggle'then
+  if n=='Hop Server (25 Chests)'then return done(binding(function()return p.other.darkbeardChestHop==true end,function(v)if not p.SetDarkbeardChestHop(v)then notice('Fist of Darkness chest hunting requires Second Sea')end end))end
+  local kills={['Auto Elite Pirate']='elite',['Kill rip_indra']='ripindra',['Kill Darkbeard']='darkbeard',['Kill Dough King']='doughking',['Kill Soul Reaper']='reaper',['Auto Factory']='factory',['Auto Pirate Raid']='raid'}
+  local spawns={['Auto Spawn Indra']='autoSpawnIndra',['Auto Spawn Dough King']='autoSpawnDoughKing',['Auto Spawn Darkbeard']='autoSpawnDarkbeard',['Auto Spawn Soul Reaper']='autoSpawnReaper'}
+  if kills[n]then local k=kills[n];return done(binding(function()return f.stackEvents[k]end,function(v)f.SetStackEvent(k,v);flush()end))end
+  if spawns[n]then local k=spawns[n];return done(binding(function()return p[k]==true end,function(v)p.SetSummonBoss(k,v)end))end
+ end
+ if section=='Info'and n=='Full Moon In'and kind=='info'then
+  for _,r in ipairs(backend.Records)do
+   if r.section=='Info'and r.class=='TextLabel'and norm(r.title:match('^[^:]+')or r.title)=='fullmoonin'then
+    return done(binding(function()
+     local text=r.node.Text
+     return text:gsub('^[^:]+:%s*',''),r.node.TextColor3,text:match('^([^:]+):')
+    end))
+   end
+  end
+ end
  if kind=='info'then
   for _,r in ipairs(backend.Records)do
    if r.section==section and r.class=='TextLabel'and norm(r.title:match('^[^:]+')or r.title)==norm(n)then return done(recordBinding(r,kind))end
@@ -10064,6 +10861,14 @@ local function resolveBinding(section,spec,kind,occurrence,group)
    for _,pl in ipairs(game.Players:GetPlayers())do if v[pl.Name]then s.group.members[tostring(pl.UserId)]=true end end
    if count>=2 then s.group.count=count end;flush()
   end))
+ elseif section=='Sea Event'and n=='Auto Collect Bones'then
+  return done(binding(function()return p.Volcano.Snapshot().collectBones end,p.Volcano.SetCollectBones))
+ elseif section=='Sea Event'and n=='Auto Collect Eggs'then
+  return done(binding(function()return p.Volcano.Snapshot().collectEggs end,p.Volcano.SetCollectEggs))
+ elseif section=='Farm Other'and n=='Farm Halloween'then
+  return done(binding(function()return p.Halloween.Snapshot().enabled end,p.Halloween.SetEnabled))
+ elseif section=='Get Items'and n=='Auto CDK Quest'then
+  return done(binding(function()return p.CDK.Snapshot().enabled end,p.CDK.SetEnabled))
  elseif section=='Sea Event'and n=='Crack skill tools'then
   return done(binding(function()return p.Volcano.Snapshot().tools end,function(v)p.Volcano.Configure(nil,v)end))
  elseif section=='Sea Event'and n=='Golem weapon'then
@@ -10073,6 +10878,8 @@ local function resolveBinding(section,spec,kind,occurrence,group)
   return done(binding(function()return p.levi and p.levi.returnIsland or 'Tiki' end,base.set))
  end
  local lookup=n;local index=occurrence or 1
+ if section=='Stack Farm'and n=='Store Fruit'then section='Raid + Fruit';index=1
+ elseif section=='Stack Farm'and n=='Hop Server'then index=group=='Fruit'and 1 or 2 end
  if section=='Sea Event'then
   if n=='My role'then index=group=='Leviathan Hunt'and 2 or 1 end
   if n=='Refresh player list'then index=group=='Leviathan Hunt'and 2 or 1 end
@@ -10102,8 +10909,8 @@ getgenv().NexoMenuBindingAudit=bridgeAudit
 local LOGO_ID = "rbxassetid://140686261014577" -- full logo picture
 -- where the logo sits inside that picture (pixels of the original 640x640 image)
 local LOGO_IMG_W, LOGO_IMG_H = 640, 640
-local LOGO_LEFT, LOGO_RIGHT = 8, 631
-local LOGO_TOP, LOGO_SPLIT, LOGO_BOTTOM = 5, 316, 627
+local LOGO_LEFT, LOGO_RIGHT = 100, 555
+local LOGO_TOP, LOGO_SPLIT, LOGO_BOTTOM = 54, 303, 552
 local SOUND_VOLUME = 0.6
 local LOGO_OPEN_WIDTH = 164   -- logo width when the menu is open
 local LOGO_REST_WIDTH = 66    -- small logo width when the menu is closed
@@ -10265,21 +11072,31 @@ local SECTIONS = {
 		{ t = "toggle", n = "Farm Cake Prince" },
 	} },
 	{ name = "Stack Farm", rows = {
+		{ t = "head", n = "Fruit" },
 		{ t = "toggle", n = "Collect & Store Fruit" },
+		{ t = "toggle", n = "Store Fruit" },
 		{ t = "toggle", n = "Hop Server", sub = true },
+		{ t = "head", n = "Indra" },
 		{ t = "toggle", n = "Auto Elite Pirate" },
 		{ t = "toggle", n = "Hop Server", sub = true },
 		{ t = "toggle", n = "Kill rip_indra" },
 		{ t = "toggle", n = "Auto Spawn Indra" },
-		{ t = "toggle", n = "Kill Darkbeard" },
-		{ t = "toggle", n = "Auto Spawn Darkbeard" },
-		{ t = "toggle", n = "Auto Factory" },
-		{ t = "toggle", n = "Auto Pirate Raid" },
+		{ t = "head", n = "Dough King" },
 		{ t = "toggle", n = "Kill Dough King" },
 		{ t = "toggle", n = "Auto Spawn Dough King" },
+		{ t = "head", n = "Darkbeard" },
+		{ t = "toggle", n = "Kill Darkbeard" },
+		{ t = "toggle", n = "Auto Spawn Darkbeard" },
+		{ t = "toggle", n = "Hop Server (25 Chests)" },
+		{ t = "head", n = "Reaper" },
 		{ t = "toggle", n = "Kill Soul Reaper" },
+		{ t = "toggle", n = "Auto Spawn Soul Reaper" },
+		{ t = "head", n = "Event in Game" },
+		{ t = "toggle", n = "Auto Factory" },
+		{ t = "toggle", n = "Auto Pirate Raid" },
 	} },
 	{ name = "Farm Other", rows = {
+		{ t = "toggle", n = "Farm Halloween" },
 		{ t = "toggle", n = "Pick up berry", hop = true },
 		{ t = "toggle", n = "Buy aura / recipe" },
 		{ t = "toggle", n = "Buy legendary sword" },
@@ -10290,10 +11107,10 @@ local SECTIONS = {
 	} },
 	{ name = "Get Items", rows = {
 		{ t = "toggle", n = "Auto Saber" },
-		{ t = "toggle", n = "Collect Fist of Darkness" },
 		{ t = "toggle", n = "Auto Tushita" },
 		{ t = "toggle", n = "Get Rengoku (Hidden Key)" },
 		{ t = "toggle", n = "Auto Soul Guitar" },
+		{ t = "toggle", n = "Auto CDK Quest" },
 	} },
 	{ name = "Sea Event", rows = {
 		{ t = "drop", n = "Zone", opts = { "1", "2", "3", "4", "5", "6" } },
@@ -10332,6 +11149,8 @@ local SECTIONS = {
 		{ t = "toggle", n = "Auto Volcano Event" },
 		{ t = "drop", n = "Golem weapon", opts = { "Gun", "Melee", "Sword", "Fruit" } },
 		{ t = "drop", n = "Crack skill tools", opts = { "Fruit", "Gun", "Sword", "Melee" }, multi = true },
+		{ t = "toggle", n = "Auto Collect Bones", on = true },
+		{ t = "toggle", n = "Auto Collect Eggs", on = true },
 	} },
 	{ name = "Raid + Fruit", rows = {
 		{ t = "drop", n = "Select Raid", opts = RAIDS, v = "Flame" },
@@ -10339,7 +11158,6 @@ local SECTIONS = {
 		{ t = "toggle", n = "Unstore Low Fruit" },
 		{ t = "toggle", n = "Auto Awaken Fruit" },
 		{ t = "toggle", n = "Roll Fruit" },
-		{ t = "toggle", n = "Store Fruit" },
 	} },
 	{ name = "V4 Trial", rows = {
 		{ t = "btn", n = "Tween to Trial", b = "GO" },
@@ -11173,17 +11991,23 @@ local function buildRow(page, spec, order)
 	elseif t == "info" then
 		local text=rowText(plateF,spec.v or "—",15,C.LightGrey,Enum.TextXAlignment.Right,330)
   text.TextWrapped=true;place(text)
-  local info=bind("info");watch(info,function()local v,color=info.get();text.Text=tostring(v or "—");if color then text.TextColor3=color end end)
+  local info=bind("info");spec.infoBinding=info;watch(info,function()local v,color=info.get();text.Text=tostring(v or "—");if color then text.TextColor3=color end end)
 	end
 
 	local nameX = 30
 	diamond(plateF, 8, UDim2.new(0, 16, 0.5, 0), spec.sub and C.Muted or C.Trim, nil, nil, 4)
-	new("TextLabel", {
+	local nameLabel = new("TextLabel", {
 		Size = UDim2.new(1, -(rx + nameX), 1, 0), Position = UDim2.fromOffset(nameX, 0),
 		BackgroundTransparency = 1, Text = spec.n, TextSize = spec.sub and 16 or 18, FontFace = FONT_SECTION,
 		TextColor3 = spec.sub and C.LightGrey or C.SoftWhite, TextXAlignment = Enum.TextXAlignment.Left,
 		TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4, Parent = plateF,
 	})
+ if spec.infoBinding then
+  watch(spec.infoBinding,function()
+   local _,_,title=spec.infoBinding.get()
+   if title then nameLabel.Text=p.TranslateText(title)end
+  end)
+ end
 end
 
 local pages = {}
