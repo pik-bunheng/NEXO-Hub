@@ -7159,7 +7159,7 @@ do
  local panel=panels['Sea Event'];local token;local serial=0;local boat;local seat;local driving
  local sailingCollisions={};local sailingVelocity={};local flying;local phase='idle';local chosen;local noDamage={};local tracked={};local hadBoss=false
  local arrivalCharacter;local arrivalPoint
- local bodyParts={};local arrived=false;local savedWeapon;local savedTool;local pending=false;local boatBuyAt=0
+ local bodyParts={};local damageDone={};local arrived=false;local savedWeapon;local savedTool;local pending=false;local boatBuyAt=0
  local TIKI=Vector3.new(-16929,8,435)
  local function config()
   preferences.levi=preferences.levi or {}
@@ -7171,6 +7171,7 @@ do
   if c.returnHeart==nil then c.returnHeart=true end
   c.returnIsland=c.returnIsland=='Hydra' and 'Hydra' or 'Tiki'
   c.speed=math.clamp(tonumber(c.speed) or 120,40,350)
+  c.segmentHp=35000
   return c
  end
  local function row(name,y)
@@ -7234,7 +7235,7 @@ do
  local function stop()
   if boat and boat.Parent and seat and seat.Parent then rememberedPosition=seat.Position;rememberedOwner=config().owner;recoverBoat=true end
   local keepHeart=phase=='heart-done' or phase=='heart-return' or phase=='heart-arrived'
-  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};hadBoss=false
+  serial=serial+1;release();phase=keepHeart and phase or 'idle';arrived=false;arrivalCharacter=nil;arrivalPoint=nil;chosen=nil;tracked={};bodyParts={};damageDone={};hadBoss=false
  end
  local function claim()
   if token and farm.SeaActive(token) then return true end
@@ -7448,10 +7449,17 @@ do
    count=count+1;local hp=object.Parent and health(object) or lastHP
    if hp and hp<=0 then dead=dead+1 end
   end
-  -- Do not infer that the main section is unlocked merely because other sections are not streamed in.
-  local mainReady=count>=3 and dead==count
-  local filtered={};for _,v in ipairs(result) do if not v.main or mainReady then table.insert(filtered,v) end end
-  return filtered
+  local bodyList={};local headList={}
+  for _,v in ipairs(result) do
+   if v.main then table.insert(headList,v) else table.insert(bodyList,v) end
+  end
+  if #bodyList>0 then return bodyList end
+  if count<3 and #headList>0 and not (count>0 and dead>=count) then
+   status.Text='Waiting for Leviathan segments to load'
+   return {}
+  end
+  for _,v in ipairs(headList) do noDamage[v.object]=nil end
+  return headList
  end
  local function combat(target,id)
   stopDrive();phase='combat';local h,r=body();if not h then return end
@@ -7461,14 +7469,37 @@ do
   local point=target.part.Position
   if (r.Position-point).Magnitude>70 then if not move(point+Vector3.new(0,18,10),id) then return end end
   farm.SeaHover(target.part,token,18,false)
-  local startHP=health(target.object);local deadline=os.clock()+5
-  status.Text='Attacking '..target.object.Name
+  local startHP=health(target.object) or 0;local lastHP=startHP;local preCombat=damageDone[target.object] or 0
+  local deadline=os.clock()+5
+  local limit=config().segmentHp
   repeat
    if not active(id) or not config().attack or not target.part.Parent then return end
    local hp=health(target.object);if not hp or hp<=0 then return end
-   farm.SeaAttackPart(target.model,target.part,token);task.wait(.08)
-  until os.clock()>deadline
-  if health(target.object)==startHP then noDamage[target.object]=os.clock()+10;status.Text='No damage confirmed; checking another segment' end
+   if phase=='heart' or phase=='heart-done' or phase=='heart-return' or findHeart() then return end
+   local _,curRoot=body()
+   if curRoot and (curRoot.Position-target.part.Position).Magnitude>90 then
+    move(target.part.Position+Vector3.new(0,18,10),id)
+   end
+   farm.SeaAttackPart(target.model,target.part,token)
+   if hp<lastHP then
+    damageDone[target.object]=(damageDone[target.object] or 0)+(lastHP-hp)
+    lastHP=hp
+   end
+   if not target.main and (damageDone[target.object] or 0)>=limit then
+    status.Text=limit..' HP dealt; rotating to next segment'
+    return
+   end
+   if target.main then
+    status.Text='Attacking '..target.object.Name..' [Head Phase: '..math.floor(hp)..' HP]'
+   else
+    status.Text='Attacking '..target.object.Name..' ['..math.floor(damageDone[target.object] or 0)..'/'..limit..' HP]'
+   end
+   task.wait(.08)
+  until (not target.main and os.clock()>deadline)
+  if not target.main and (damageDone[target.object] or 0)==preCombat then
+   noDamage[target.object]=os.clock()+10
+   status.Text='No damage confirmed; checking another segment'
+  end
  end
  local heartTarget;local heartScanAt=0;local heartShotAt=0;local heartShots=0;local shotObjects={}
  local function findHeart()
@@ -7622,7 +7653,25 @@ do
   if phase=='heart-arrived' then return end
   if c.attack then
    local list=segments();local target
-   for _,v in ipairs(list) do if (noDamage[v.object] or 0)<os.clock() then target=v;break end end
+   local limit=c.segmentHp
+   for _,v in ipairs(list) do
+    if (noDamage[v.object] or 0)<os.clock() and (v.main or (damageDone[v.object] or 0)<limit) then
+     target=v;break
+    end
+   end
+   if not target and #list>0 then
+    local allRotated=true
+    for _,v in ipairs(list) do
+     if not v.main and (damageDone[v.object] or 0)<limit then allRotated=false;break end
+    end
+    if allRotated then
+     for _,v in ipairs(list) do if not v.main then damageDone[v.object]=0 end end
+     status.Text='Rotation cycle complete; restarting '..limit..' HP cycle'
+     for _,v in ipairs(list) do
+      if (noDamage[v.object] or 0)<os.clock() then target=v;break end
+     end
+    end
+   end
    if target then combat(target,id);return end
    if #list>0 then stopDrive();status.Text='Waiting to retry damageable Leviathan segments';return end
    if hadBoss and #list==0 then
@@ -10909,8 +10958,8 @@ getgenv().NexoMenuBindingAudit=bridgeAudit
 local LOGO_ID = "rbxassetid://140686261014577" -- full logo picture
 -- where the logo sits inside that picture (pixels of the original 640x640 image)
 local LOGO_IMG_W, LOGO_IMG_H = 640, 640
-local LOGO_LEFT, LOGO_RIGHT = 100, 555
-local LOGO_TOP, LOGO_SPLIT, LOGO_BOTTOM = 54, 303, 552
+local LOGO_LEFT, LOGO_RIGHT = 0, 640
+local LOGO_TOP, LOGO_SPLIT, LOGO_BOTTOM = 0, 320, 640
 local SOUND_VOLUME = 0.6
 local LOGO_OPEN_WIDTH = 164   -- logo width when the menu is open
 local LOGO_REST_WIDTH = 66    -- small logo width when the menu is closed
@@ -11137,7 +11186,7 @@ local SECTIONS = {
 		{ t = "toggle", n = "Tween to boat / Ride" },
 		{ t = "toggle", n = "Find Frozen Dimension" },
 		{ t = "toggle", n = "Auto Attack Leviathan" },
-		{ t = "choice", n = "Attack weapon", opts = { "Dragonstorm", "M1 Fruit" }, v = "Dragonstorm", w = 110 },
+		{ t = "choice", n = "Attack weapon", opts = { "Dragonstorm", "M1 Fruit" }, v = "Dragonstorm" },
 		{ t = "toggle", n = "Lift boat away from danger", on = true },
 		{ t = "toggle", n = "Manual driving speed" },
 		{ t = "num", n = "Manual speed value", num = { 40, 350, 120, 10 } },
